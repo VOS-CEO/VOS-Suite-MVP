@@ -1,0 +1,16 @@
+﻿# OS / IDE
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+*.log
+
+# Secrets
+.env*
+!.env.example
