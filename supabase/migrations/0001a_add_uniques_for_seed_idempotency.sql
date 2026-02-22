@@ -1,16 +1,15 @@
 begin;
 
--- Makes seed scripts safe to rerun with ON CONFLICT
--- 1) Vessel name unique (so ON CONFLICT (name) works)
-alter table public.vessels
-  add constraint if not exists vessels_name_unique unique (name);
+-- 1) vessels(name) unique (enables ON CONFLICT (name))
+create unique index if not exists ux_vessels_name
+on public.vessels (name);
 
--- 2) Prevent duplicate systems per vessel
-alter table public.equipment_system
-  add constraint if not exists equipment_system_unique_per_vessel unique (vessel_id, name);
+-- 2) equipment_system unique per vessel
+create unique index if not exists ux_equipment_system_vessel_name
+on public.equipment_system (vessel_id, name);
 
--- 3) Prevent duplicate locations per vessel
-alter table public.location
-  add constraint if not exists location_unique_per_vessel unique (vessel_id, name);
+-- 3) location unique per vessel
+create unique index if not exists ux_location_vessel_name
+on public.location (vessel_id, name);
 
 commit;
