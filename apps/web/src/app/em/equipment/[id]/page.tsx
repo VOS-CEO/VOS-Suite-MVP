@@ -22,8 +22,14 @@ type FieldItem = {
   name: string;
   unit: string;
   input_type: string;
+  options_json: unknown | null;
+  expected_min: number | null;
+  expected_max: number | null;
+  severity: string;
   group: string;
   sort_order: number;
+  default_log_enabled: boolean;
+  override_log_enabled: boolean | null;
   effective_log_enabled: boolean;
 };
 
@@ -40,13 +46,46 @@ async function getJson<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export default async function EquipmentDetailPage({ params }: { params: { id: string } }) {
+function isUuid(x: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
+}
+
+export default async function EquipmentDetailPage({
+  params,
+}: {
+  // In your setup, TS may treat params as async; this avoids "undefined" issues.
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+
+  if (!id || !isUuid(id)) {
+    return (
+      <main className="p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">Equipment Detail</h1>
+          <Link className="underline text-sm" href="/em/equipment">
+            ← Back to list
+          </Link>
+        </div>
+
+        <div className="rounded border p-4 text-sm">
+          <p className="text-red-600">
+            Invalid or missing equipment id in the URL.
+          </p>
+          <p className="mt-2 text-gray-600">
+            Go back to the list and click an equipment name again.
+          </p>
+        </div>
+      </main>
+    );
+  }
+
   const base = await baseUrl();
 
-  const eq = await getJson<EqDetail>(`${base}/api/em/equipment/${params.id}`);
-  const fieldsResp = await getJson<{ items: FieldItem[] }>(`${base}/api/em/equipment/${params.id}/fields`);
+  const eq = await getJson<EqDetail>(`${base}/api/em/equipment/${id}`);
+  const fieldsResp = await getJson<{ items: FieldItem[] }>(`${base}/api/em/equipment/${id}/fields`);
 
-  // group fields
+  // Group fields by group name
   const groups = new Map<string, FieldItem[]>();
   for (const f of fieldsResp.items) {
     const key = f.group || "General";
@@ -57,17 +96,36 @@ export default async function EquipmentDetailPage({ params }: { params: { id: st
     <main className="p-6 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">{eq.display_name}</h1>
-        <Link className="underline text-sm" href="/em/equipment">← Back to list</Link>
+        <Link className="underline text-sm" href="/em/equipment">
+          ← Back to list
+        </Link>
       </div>
 
       <div className="rounded border p-4 space-y-1 text-sm">
-        <div><b>Type:</b> {eq.equipment_type?.name ?? eq.equipment_type?.code ?? "-"}</div>
-        <div><b>System:</b> {eq.equipment_system?.name ?? "-"}</div>
-        <div><b>Location:</b> {eq.location?.name ?? "-"}</div>
-        <div><b>Criticality:</b> {eq.criticality}</div>
-        <div><b>Manufacturer:</b> {eq.manufacturer ?? "-"}</div>
-        <div><b>Model:</b> {eq.model ?? "-"}</div>
-        <div><b>Serial:</b> {eq.serial_no ?? "-"}</div>
+        <div>
+          <b>Type:</b> {eq.equipment_type?.name ?? eq.equipment_type?.code ?? "-"}
+        </div>
+        <div>
+          <b>System:</b> {eq.equipment_system?.name ?? "-"}
+        </div>
+        <div>
+          <b>Location:</b> {eq.location?.name ?? "-"}
+        </div>
+        <div>
+          <b>Criticality:</b> {eq.criticality}
+        </div>
+        <div>
+          <b>Manufacturer:</b> {eq.manufacturer ?? "-"}
+        </div>
+        <div>
+          <b>Model:</b> {eq.model ?? "-"}
+        </div>
+        <div>
+          <b>Serial:</b> {eq.serial_no ?? "-"}
+        </div>
+        <div>
+          <b>Active:</b> {eq.active ? "Yes" : "No"}
+        </div>
       </div>
 
       <div className="space-y-4">
@@ -84,13 +142,16 @@ export default async function EquipmentDetailPage({ params }: { params: { id: st
                   </tr>
                 </thead>
                 <tbody>
-                  {items.sort((a, b) => a.sort_order - b.sort_order).map((f) => (
-                    <tr key={f.field_id} className="border-t">
-                      <td className="py-1 pr-3">{f.name}</td>
-                      <td className="py-1 pr-3">{f.unit}</td>
-                      <td className="py-1 pr-3">{f.effective_log_enabled ? "Yes" : "No"}</td>
-                    </tr>
-                  ))}
+                  {items
+                    .slice()
+                    .sort((a, b) => a.sort_order - b.sort_order)
+                    .map((f) => (
+                      <tr key={f.field_id} className="border-t">
+                        <td className="py-1 pr-3">{f.name}</td>
+                        <td className="py-1 pr-3">{f.unit}</td>
+                        <td className="py-1 pr-3">{f.effective_log_enabled ? "Yes" : "No"}</td>
+                      </tr>
+                    ))}
                 </tbody>
               </table>
             </div>
