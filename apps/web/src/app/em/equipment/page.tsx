@@ -51,10 +51,14 @@ export default async function EquipmentPage() {
           <tbody>
             {items.map((x) => (
               <tr key={x.id} className="border-t">
-                <td className="p-2">
-  <Link className="underline" href={`/em/equipment/${x.id}`}>
-    {x.display_name}
-  </Link>
+    <td className="p-2">
+  {x.id ? (
+    <Link className="underline" href={`/em/equipment/${x.id}`}>
+      {x.display_name}
+    </Link>
+  ) : (
+    <span className="text-red-600">Missing ID</span>
+  )}
 </td>
                 <td className="p-2">{x.equipment_type?.name ?? x.equipment_type?.code ?? "-"}</td>
                 <td className="p-2">{x.equipment_system?.name ?? "-"}</td>
