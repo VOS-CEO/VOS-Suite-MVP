@@ -1,9 +1,40 @@
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-export async function POST(req: Request, { params }: { params: { id: string } }) {
+// ✅ Next.js 16 / Turbopack in your project treats params as async in some routes.
+// Use ctx.params as a Promise and await it (same as your working E&M route).
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function GET(req: Request, ctx: Ctx) {
   const sb = supabaseServer();
-  const dailyLogId = params.id;
+  const { id: dailyLogId } = await ctx.params;
+
+  const url = new URL(req.url);
+  const equipmentId = url.searchParams.get("equipmentId");
+  const fieldId = url.searchParams.get("fieldId");
+
+  if (!equipmentId) return NextResponse.json({ error: "equipmentId required" }, { status: 400 });
+  if (!fieldId) return NextResponse.json({ error: "fieldId required" }, { status: 400 });
+
+  const { data, error } = await sb
+    .from("meter_readings")
+    .select("value,unit,recorded_at")
+    .eq("context_id", dailyLogId)
+    .eq("source", "DAILY_LOG")
+    .eq("equipment_id", equipmentId)
+    .eq("field_id", fieldId)
+    .order("recorded_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  return NextResponse.json({ reading: data ?? null });
+}
+
+export async function POST(req: Request, ctx: Ctx) {
+  const sb = supabaseServer();
+  const { id: dailyLogId } = await ctx.params;
 
   const body = await req.json().catch(() => ({}));
   const equipmentId = body?.equipmentId as string | undefined;
