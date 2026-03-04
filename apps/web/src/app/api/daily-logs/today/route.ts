@@ -21,16 +21,25 @@ export async function GET() {
 
   const log_date = todayISO();
 
-  // Create if missing (idempotent). If you don’t have a unique constraint, we’ll adjust next step.
+  // Create if missing (idempotent)
+  // Ensure status is set to a known default on insert.
   const { error: upErr } = await sb
     .from("daily_logs")
-    .upsert({ vessel_id: vessel.id, log_date }, { onConflict: "vessel_id,log_date" });
+    .upsert(
+      {
+        vessel_id: vessel.id,
+        log_date,
+        status: "dock",
+      },
+      { onConflict: "vessel_id,log_date" }
+    );
 
   if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
 
+  // Load today’s log with a stable field list (Step 3 needs these)
   const { data: log, error: lErr } = await sb
     .from("daily_logs")
-    .select("*")
+    .select("id,vessel_id,log_date,status,location_text,weather_text,notes,submitted_at")
     .eq("vessel_id", vessel.id)
     .eq("log_date", log_date)
     .maybeSingle();

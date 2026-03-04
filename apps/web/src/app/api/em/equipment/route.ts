@@ -12,12 +12,15 @@ export async function GET(req: Request) {
 
   const { data, error } = await sb
     .from("equipment_instance")
-    .select(`
-      id, display_name, criticality, active,
+    .select(
+      `
+      id,
+      display_name,
+      location_id,
       equipment_type:equipment_type ( code, name, category ),
-      equipment_system:equipment_system ( name ),
-      location:location ( name )
-    `)
+      location:location ( id, name, parent_location_id )
+    `
+    )
     .eq("vessel_id", vesselId)
     .order("display_name", { ascending: true });
 

@@ -1,6 +1,6 @@
 export const dynamic = "force-dynamic";
 
-import DailyLogClient from "./DailyLogClient";
+import DailyLogClient, { MeterTarget } from "./DailyLogClient";
 import { headers } from "next/headers";
 
 async function getBaseUrl() {
@@ -15,7 +15,14 @@ async function getToday(baseUrl: string) {
   if (!res.ok) throw new Error(await res.text());
   return res.json() as Promise<{
     vessel: { id: string; name: string };
-    log: { id: string; location_text?: string | null };
+    log: {
+      id: string;
+      status: string;
+      location_text?: string | null;
+      weather_text?: string | null;
+      notes?: string | null;
+      submitted_at?: string | null;
+    };
   }>;
 }
 
@@ -23,6 +30,7 @@ type EquipmentItem = {
   id: string;
   display_name: string;
   equipment_type?: { code: string; name: string } | null;
+  location?: { id: string; name: string; parent_location_id?: string | null } | null;
 };
 
 async function getEquipmentList(baseUrl: string, vesselId: string): Promise<EquipmentItem[]> {
@@ -37,7 +45,6 @@ async function getRunHoursFieldId(baseUrl: string, equipmentId: string): Promise
   if (!res.ok) throw new Error(await res.text());
   const json = await res.json();
 
-  // Your endpoint returns: { equipment_id, items }
   const fields = (json.items ?? []) as Array<{ field_id: string; code: string }>;
   const run = fields.find((f) => f.code === "RUN_HOURS");
   if (!run) throw new Error(`RUN_HOURS field not found for equipment ${equipmentId}`);
@@ -62,27 +69,52 @@ async function getSavedHours(
   return typeof v === "number" ? v : null;
 }
 
+async function buildRunHoursTargets(
+  baseUrl: string,
+  dailyLogId: string,
+  equipment: EquipmentItem[],
+  typeCode: "MAIN_ENGINE" | "DIESEL_GENERATOR"
+): Promise<{ targets: MeterTarget[]; initialHoursByEquipmentId: Record<string, number | null> }> {
+  const items = equipment
+    .filter((e) => (e.equipment_type?.code ?? "") === typeCode)
+    .sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  if (items.length === 0) throw new Error(`No ${typeCode} equipment found (seed missing?)`);
+
+  const targets: MeterTarget[] = await Promise.all(
+    items.map(async (eq) => ({
+      equipmentId: eq.id,
+      equipmentName: eq.display_name,
+      runHoursFieldId: await getRunHoursFieldId(baseUrl, eq.id),
+      locationName: eq.location?.name ?? null,
+    }))
+  );
+
+  const entries = await Promise.all(
+    targets.map(async (t) => {
+      const v = await getSavedHours(baseUrl, dailyLogId, t.equipmentId, t.runHoursFieldId);
+      return [t.equipmentId, v] as const;
+    })
+  );
+
+  return { targets, initialHoursByEquipmentId: Object.fromEntries(entries) as Record<string, number | null> };
+}
+
 export default async function DailyLogPage() {
   const baseUrl = await getBaseUrl();
 
   const { vessel, log } = await getToday(baseUrl);
   const equipment = await getEquipmentList(baseUrl, vessel.id);
 
-  const mainEngine = equipment.find((e) => (e.equipment_type?.code ?? "") === "MAIN_ENGINE");
-  if (!mainEngine) throw new Error("No MAIN_ENGINE equipment found (seed missing?)");
-
-  const dieselGen = equipment.find((e) => (e.equipment_type?.code ?? "") === "DIESEL_GENERATOR");
-  if (!dieselGen) throw new Error("No DIESEL_GENERATOR equipment found (seed missing?)");
-
-  const [meRunHoursFieldId, dgRunHoursFieldId] = await Promise.all([
-    getRunHoursFieldId(baseUrl, mainEngine.id),
-    getRunHoursFieldId(baseUrl, dieselGen.id),
+  const [
+    { targets: mainEngines, initialHoursByEquipmentId: meHours },
+    { targets: dieselGens, initialHoursByEquipmentId: dgHours },
+  ] = await Promise.all([
+    buildRunHoursTargets(baseUrl, log.id, equipment, "MAIN_ENGINE"),
+    buildRunHoursTargets(baseUrl, log.id, equipment, "DIESEL_GENERATOR"),
   ]);
 
-  const [initialMainEngineHours, initialDieselGenHours] = await Promise.all([
-    getSavedHours(baseUrl, log.id, mainEngine.id, meRunHoursFieldId),
-    getSavedHours(baseUrl, log.id, dieselGen.id, dgRunHoursFieldId),
-  ]);
+  const initialHoursByEquipmentId: Record<string, number | null> = { ...meHours, ...dgHours };
 
   return (
     <main className="p-6 space-y-4">
@@ -91,19 +123,14 @@ export default async function DailyLogPage() {
 
       <DailyLogClient
         dailyLogId={log.id}
+        status={log.status ?? "dock"}
         locationText={log.location_text ?? ""}
-        mainEngine={{
-          equipmentId: mainEngine.id,
-          equipmentName: mainEngine.display_name,
-          runHoursFieldId: meRunHoursFieldId,
-        }}
-        dieselGen={{
-          equipmentId: dieselGen.id,
-          equipmentName: dieselGen.display_name,
-          runHoursFieldId: dgRunHoursFieldId,
-        }}
-        initialMainEngineHours={initialMainEngineHours}
-        initialDieselGenHours={initialDieselGenHours}
+        weatherText={log.weather_text ?? ""}
+        notes={log.notes ?? ""}
+        submittedAt={log.submitted_at ?? null}
+        mainEngines={mainEngines}
+        dieselGens={dieselGens}
+        initialHoursByEquipmentId={initialHoursByEquipmentId}
       />
     </main>
   );
