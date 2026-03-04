@@ -28,8 +28,34 @@ export type MeterTarget = {
   equipmentId: string;
   equipmentName: string;
   runHoursFieldId: string;
-  locationName: string | null; // NEW: used for Port/Center/Stbd layout
+  locationName: string | null;
 };
+
+export type ChillerPlantTarget =
+  | {
+      kind: "CHILLER";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: { RUNNING: string | null; TEMP_SUPPLY: string | null; TEMP_RETURN: string | null };
+    }
+  | {
+      kind: "CHW_SELECT" | "SW_SELECT";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: { SELECTED_PUMP: string | null };
+    };
+
+function isChiller(x: ChillerPlantTarget): x is Extract<ChillerPlantTarget, { kind: "CHILLER" }> {
+  return x.kind === "CHILLER";
+}
+function isChwSelect(x: ChillerPlantTarget | null): x is Extract<ChillerPlantTarget, { kind: "CHW_SELECT" }> {
+  return !!x && x.kind === "CHW_SELECT";
+}
+function isSwSelect(x: ChillerPlantTarget | null): x is Extract<ChillerPlantTarget, { kind: "SW_SELECT" }> {
+  return !!x && x.kind === "SW_SELECT";
+}
 
 type TabCode = "MAIN" | "AHUS" | "BILGES" | "TANKS" | "ORB" | "RUNNING_LOG";
 
@@ -47,7 +73,6 @@ function requiresRunningLog(status: string | null | undefined) {
   return s === "underway" || s === "anchor";
 }
 
-// Step 4: ORB requirement logic comes later
 function requiresORB() {
   return false;
 }
@@ -63,6 +88,8 @@ function sideFromLocationName(name: string | null): "PORT" | "CENTER" | "STBD" {
   return "CENTER";
 }
 
+type MeterValue = { num?: number; bool?: boolean; text?: string };
+
 export default function DailyLogClient({
   dailyLogId,
   status: initialStatus,
@@ -73,6 +100,7 @@ export default function DailyLogClient({
   mainEngines,
   dieselGens,
   initialHoursByEquipmentId,
+  chillerPlant,
 }: {
   dailyLogId: string;
   status?: string | null;
@@ -83,23 +111,27 @@ export default function DailyLogClient({
   mainEngines: MeterTarget[];
   dieselGens: MeterTarget[];
   initialHoursByEquipmentId: Record<string, number | null>;
+  chillerPlant: {
+    chillers: ChillerPlantTarget[];
+    chwPumps: ChillerPlantTarget | null;
+    swPumps: ChillerPlantTarget | null;
+    initialValuesByKey: Record<string, string>;
+  };
 }) {
   const allTargets = useMemo(() => [...mainEngines, ...dieselGens], [mainEngines, dieselGens]);
-
   const [activeTab, setActiveTab] = useState<TabCode>("MAIN");
 
-  // Header (operational context)
+  // Header
   const [status, setStatus] = useState<string>(String(initialStatus ?? "dock"));
   const [locationText, setLocationText] = useState<string>(initialLocationText ?? "");
   const [weatherText, setWeatherText] = useState<string>(initialWeatherText ?? "");
   const [notes, setNotes] = useState<string>(initialNotes ?? "");
 
   const headerLocked = !!submittedAt;
-
   const [headerOk, setHeaderOk] = useState<string | null>(null);
   const [headerErr, setHeaderErr] = useState<string | null>(null);
 
-  // Tab state (viewed/ok)
+  // Tabs state
   const [tabState, setTabState] = useState<Record<TabCode, { viewed: boolean; ok: boolean }>>({
     MAIN: { viewed: true, ok: true },
     AHUS: { viewed: false, ok: false },
@@ -113,7 +145,7 @@ export default function DailyLogClient({
 
   const [saving, setSaving] = useState(false);
 
-  // Hours input state per equipment
+  // ME/DG hours
   const [hoursById, setHoursById] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
     for (const t of allTargets) {
@@ -123,16 +155,19 @@ export default function DailyLogClient({
     return init;
   });
 
-  // Row feedback per equipment
-  const [okById, setOkById] = useState<Record<string, string | null>>({});
-  const [errById, setErrById] = useState<Record<string, string | null>>({});
+  // Chiller plant per-field state
+  const [cpValues, setCpValues] = useState<Record<string, string>>(() => ({ ...chillerPlant.initialValuesByKey }));
 
-  // Quick defect capture
+  // Feedback per key
+  const [okByKey, setOkByKey] = useState<Record<string, string | null>>({});
+  const [errByKey, setErrByKey] = useState<Record<string, string | null>>({});
+
+  // Defects
   const [defectTitle, setDefectTitle] = useState("");
   const [defectOk, setDefectOk] = useState<string | null>(null);
   const [defectErr, setDefectErr] = useState<string | null>(null);
 
-  // Submit feedback
+  // Submit
   const [submitOk, setSubmitOk] = useState<string | null>(null);
   const [submitErr, setSubmitErr] = useState<string | null>(null);
 
@@ -173,7 +208,6 @@ export default function DailyLogClient({
         ORB: { viewed: false, ok: false },
         RUNNING_LOG: { viewed: false, ok: false },
       };
-
       for (const r of rows) {
         const code = String(r.tab_code).toUpperCase() as TabCode;
         if (!(code in next)) continue;
@@ -247,13 +281,14 @@ export default function DailyLogClient({
           notes: notes || null,
         }),
       });
-
       const json: unknown = await res.json();
       if (!res.ok) throw new Error(getErrorMessage(json, "Failed to save header"));
 
-      const nextStatus =
-        isObject(json) && isObject(json.log) && typeof json.log.status === "string" ? json.log.status : s;
-      setStatus(nextStatus);
+     let nextStatus = s;
+if (isObject(json) && "log" in json && isObject(json.log) && typeof json.log.status === "string") {
+  nextStatus = json.log.status;
+}
+setStatus(nextStatus);
 
       setHeaderOk("Header saved");
     } catch (e: unknown) {
@@ -264,13 +299,10 @@ export default function DailyLogClient({
   }
 
   async function saveRunHours(target: MeterTarget) {
-    setOkById((m) => ({ ...m, [target.equipmentId]: null }));
-    setErrById((m) => ({ ...m, [target.equipmentId]: null }));
-
     const hoursStr = (hoursById[target.equipmentId] ?? "").trim();
     const n = Number(hoursStr);
     if (hoursStr === "" || Number.isNaN(n)) {
-      setErrById((m) => ({ ...m, [target.equipmentId]: "Please enter a valid number for hours." }));
+      setErrByKey((m) => ({ ...m, [target.equipmentId]: "Please enter a valid number for hours." }));
       return;
     }
 
@@ -279,31 +311,43 @@ export default function DailyLogClient({
       const res = await fetch(`/api/daily-logs/${dailyLogId}/meter-readings/one`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          equipmentId: target.equipmentId,
-          fieldId: target.runHoursFieldId,
-          hours: n,
-        }),
+        body: JSON.stringify({ equipmentId: target.equipmentId, fieldId: target.runHoursFieldId, hours: n }),
       });
-
       const json: unknown = await res.json();
       if (!res.ok) throw new Error(getErrorMessage(json, "Failed to save hours"));
-
-      setOkById((m) => ({ ...m, [target.equipmentId]: "Saved" }));
+      setOkByKey((m) => ({ ...m, [target.equipmentId]: "Saved" }));
+      setErrByKey((m) => ({ ...m, [target.equipmentId]: null }));
     } catch (e: unknown) {
-      setErrById((m) => ({
-        ...m,
-        [target.equipmentId]: e instanceof Error ? e.message : "Failed to save hours",
-      }));
+      setErrByKey((m) => ({ ...m, [target.equipmentId]: e instanceof Error ? e.message : "Failed to save hours" }));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveReadingValue(equipmentId: string, fieldId: string, value: MeterValue, unit?: string | null) {
+    const key = `${equipmentId}:${fieldId}`;
+    setOkByKey((m) => ({ ...m, [key]: null }));
+    setErrByKey((m) => ({ ...m, [key]: null }));
+
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/daily-logs/${dailyLogId}/meter-readings/one`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ equipmentId, fieldId, value, unit: unit ?? null }),
+      });
+      const json: unknown = await res.json();
+      if (!res.ok) throw new Error(getErrorMessage(json, "Failed to save reading"));
+      setOkByKey((m) => ({ ...m, [key]: "Saved" }));
+    } catch (e: unknown) {
+      setErrByKey((m) => ({ ...m, [key]: e instanceof Error ? e.message : "Failed to save reading" }));
     } finally {
       setSaving(false);
     }
   }
 
   function RunHoursList({ items }: { items: MeterTarget[] }) {
-    if (!items.length) {
-      return <p className="text-sm text-gray-500">None</p>;
-    }
+    if (!items.length) return <p className="text-sm text-gray-500">None</p>;
     return (
       <div className="space-y-3">
         {items.map((t) => (
@@ -317,11 +361,9 @@ export default function DailyLogClient({
                   value={hoursById[t.equipmentId] ?? ""}
                   disabled={saving || headerLocked}
                   onChange={(e) => setHoursById((m) => ({ ...m, [t.equipmentId]: e.target.value }))}
-                  placeholder="e.g., 1234.5"
                   inputMode="decimal"
                 />
               </div>
-
               <button
                 className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
                 disabled={saving || headerLocked}
@@ -332,18 +374,160 @@ export default function DailyLogClient({
               </button>
             </div>
 
-            {okById[t.equipmentId] && (
-              <p className="mt-2 text-sm rounded bg-green-50 border border-green-200 p-2">
-                {okById[t.equipmentId]}
-              </p>
-            )}
-            {errById[t.equipmentId] && (
-              <p className="mt-2 text-sm rounded bg-red-50 border border-red-200 p-2">
-                {errById[t.equipmentId]}
-              </p>
-            )}
+            {okByKey[t.equipmentId] ? (
+              <p className="mt-2 text-sm rounded bg-green-50 border border-green-200 p-2">{okByKey[t.equipmentId]}</p>
+            ) : null}
+            {errByKey[t.equipmentId] ? (
+              <p className="mt-2 text-sm rounded bg-red-50 border border-red-200 p-2">{errByKey[t.equipmentId]}</p>
+            ) : null}
           </div>
         ))}
+      </div>
+    );
+  }
+
+  function ChillerPlantCard() {
+    const chillers = (chillerPlant.chillers ?? []).filter(isChiller);
+    const chw = isChwSelect(chillerPlant.chwPumps) ? chillerPlant.chwPumps : null;
+    const sw = isSwSelect(chillerPlant.swPumps) ? chillerPlant.swPumps : null;
+
+    const renderSelector = (sel: Extract<ChillerPlantTarget, { kind: "CHW_SELECT" | "SW_SELECT" }>) => {
+      const fieldId = sel.fieldIds.SELECTED_PUMP;
+      if (!fieldId) {
+        return <div className="rounded border p-3 text-sm text-gray-600">{sel.equipmentName}: SELECTED_PUMP not configured</div>;
+      }
+      const key = `${sel.equipmentId}:${fieldId}`;
+      const value = cpValues[key] ?? "1";
+
+      return (
+        <div className="rounded border p-3 space-y-2">
+          <div className="text-sm font-semibold">{sel.equipmentName}</div>
+          <select
+            className="w-full rounded border p-2"
+            disabled={saving || headerLocked}
+            value={value}
+            onChange={(e) => setCpValues((m) => ({ ...m, [key]: e.target.value }))}
+          >
+            <option value="1">1</option>
+            <option value="2">2</option>
+          </select>
+
+          <button
+            className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
+            disabled={saving || headerLocked}
+            onClick={() => saveReadingValue(sel.equipmentId, fieldId, { text: value })}
+            type="button"
+          >
+            Save
+          </button>
+
+          {okByKey[key] ? <p className="text-sm rounded bg-green-50 border border-green-200 p-2">{okByKey[key]}</p> : null}
+          {errByKey[key] ? <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{errByKey[key]}</p> : null}
+        </div>
+      );
+    };
+
+    return (
+      <div className="rounded border p-3 space-y-4">
+        <h4 className="text-sm font-semibold">Chiller Plant (Center-Top)</h4>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          {chw ? renderSelector(chw) : <div className="rounded border p-3 text-sm text-gray-600">CHW pump selector not found.</div>}
+          {sw ? renderSelector(sw) : <div className="rounded border p-3 text-sm text-gray-600">SW pump selector not found.</div>}
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2">
+          {chillers.map((c) => {
+            const runningId = c.fieldIds.RUNNING;
+            const tsId = c.fieldIds.TEMP_SUPPLY;
+            const trId = c.fieldIds.TEMP_RETURN;
+
+            const keyRun = runningId ? `${c.equipmentId}:${runningId}` : null;
+            const keyTs = tsId ? `${c.equipmentId}:${tsId}` : null;
+            const keyTr = trId ? `${c.equipmentId}:${trId}` : null;
+
+            const runningVal = keyRun ? cpValues[keyRun] ?? "false" : "false";
+
+            return (
+              <div key={c.equipmentId} className="rounded border p-3 space-y-2">
+                <div className="text-sm font-semibold">{c.equipmentName}</div>
+
+                {runningId && keyRun ? (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      disabled={saving || headerLocked}
+                      checked={runningVal === "true"}
+                      onChange={(e) => setCpValues((m) => ({ ...m, [keyRun]: e.target.checked ? "true" : "false" }))}
+                    />
+                    Running
+                  </label>
+                ) : (
+                  <p className="text-sm text-gray-600">RUNNING not configured.</p>
+                )}
+
+                <div className="grid gap-2 md:grid-cols-2">
+                  <label className="text-sm block">
+                    Supply °C
+                    <input
+                      className="mt-1 w-full rounded border p-2"
+                      disabled={saving || headerLocked}
+                      value={keyTs ? cpValues[keyTs] ?? "" : ""}
+                      onChange={(e) => keyTs && setCpValues((m) => ({ ...m, [keyTs]: e.target.value }))}
+                      inputMode="decimal"
+                      placeholder="e.g., 7.0"
+                    />
+                  </label>
+
+                  <label className="text-sm block">
+                    Return °C
+                    <input
+                      className="mt-1 w-full rounded border p-2"
+                      disabled={saving || headerLocked}
+                      value={keyTr ? cpValues[keyTr] ?? "" : ""}
+                      onChange={(e) => keyTr && setCpValues((m) => ({ ...m, [keyTr]: e.target.value }))}
+                      inputMode="decimal"
+                      placeholder="e.g., 12.0"
+                    />
+                  </label>
+                </div>
+
+                <button
+                  className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
+                  disabled={saving || headerLocked}
+                  onClick={() => {
+                    if (runningId && keyRun) {
+                      saveReadingValue(c.equipmentId, runningId, { bool: (cpValues[keyRun] ?? "false") === "true" });
+                    }
+                    if (tsId && keyTs) {
+                      const n = Number(cpValues[keyTs] ?? "");
+                      if (!Number.isNaN(n)) saveReadingValue(c.equipmentId, tsId, { num: n }, "C");
+                    }
+                    if (trId && keyTr) {
+                      const n = Number(cpValues[keyTr] ?? "");
+                      if (!Number.isNaN(n)) saveReadingValue(c.equipmentId, trId, { num: n }, "C");
+                    }
+                  }}
+                  type="button"
+                >
+                  Save chiller
+                </button>
+
+                {[keyRun, keyTs, keyTr].filter(Boolean).map((k) =>
+                  okByKey[k as string] ? (
+                    <p key={k as string} className="text-sm rounded bg-green-50 border border-green-200 p-2">
+                      {okByKey[k as string]}
+                    </p>
+                  ) : errByKey[k as string] ? (
+                    <p key={k as string} className="text-sm rounded bg-red-50 border border-red-200 p-2">
+                      {errByKey[k as string]}
+                    </p>
+                  ) : null
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     );
   }
@@ -464,7 +648,6 @@ export default function DailyLogClient({
     );
   }
 
-  // Group equipment by location side
   const mePort = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "PORT");
   const meCenter = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "CENTER");
   const meStbd = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "STBD");
@@ -486,7 +669,7 @@ export default function DailyLogClient({
         </div>
       </div>
 
-      {/* Main tab: Operational context + submit */}
+      {/* Main tab context */}
       {activeTab === "MAIN" ? (
         <section className="rounded border p-4 space-y-3">
           <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -516,7 +699,6 @@ export default function DailyLogClient({
                     value={locationText}
                     disabled={saving || headerLocked}
                     onChange={(e) => setLocationText(e.target.value)}
-                    placeholder="e.g., Palma de Mallorca"
                   />
                 </label>
 
@@ -527,7 +709,6 @@ export default function DailyLogClient({
                     value={weatherText}
                     disabled={saving || headerLocked}
                     onChange={(e) => setWeatherText(e.target.value)}
-                    placeholder="e.g., NW 15kt, slight seas"
                   />
                 </label>
 
@@ -550,20 +731,15 @@ export default function DailyLogClient({
                     disabled={saving || headerLocked}
                     onChange={(e) => setNotes(e.target.value)}
                     rows={4}
-                    placeholder="Anything the engineer wants noted for today…"
                   />
                 </label>
               </div>
 
-              {headerOk ? (
-                <p className="text-sm rounded bg-green-50 border border-green-200 p-2">{headerOk}</p>
-              ) : null}
-              {headerErr ? (
-                <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{headerErr}</p>
-              ) : null}
+              {headerOk ? <p className="text-sm rounded bg-green-50 border border-green-200 p-2">{headerOk}</p> : null}
+              {headerErr ? <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{headerErr}</p> : null}
 
               <p className="text-sm text-gray-600">
-                Running Log required today: <b>{runningLogRequired ? "YES" : "NO"}</b>
+                Running Log required today: <b>{requiresRunningLog(status) ? "YES" : "NO"}</b>
               </p>
             </div>
 
@@ -578,9 +754,7 @@ export default function DailyLogClient({
               </button>
 
               {headerLocked ? (
-                <p className="mt-2 text-sm rounded bg-blue-50 border border-blue-200 p-2">
-                  This Daily Log is submitted and locked.
-                </p>
+                <p className="mt-2 text-sm rounded bg-blue-50 border border-blue-200 p-2">This Daily Log is submitted and locked.</p>
               ) : submitBlocked.length ? (
                 <p className="mt-2 text-sm rounded bg-amber-50 border border-amber-200 p-2">
                   Missing OK: <b>{submitBlocked.join(", ")}</b>
@@ -589,67 +763,46 @@ export default function DailyLogClient({
                 <p className="mt-2 text-sm text-gray-600">All required tabs OK’d — ready to submit.</p>
               )}
 
-              {submitOk ? (
-                <p className="mt-2 text-sm rounded bg-green-50 border border-green-200 p-2">{submitOk}</p>
-              ) : null}
-              {submitErr ? (
-                <p className="mt-2 text-sm rounded bg-red-50 border border-red-200 p-2">{submitErr}</p>
-              ) : null}
+              {submitOk ? <p className="mt-2 text-sm rounded bg-green-50 border border-green-200 p-2">{submitOk}</p> : null}
+              {submitErr ? <p className="mt-2 text-sm rounded bg-red-50 border border-red-200 p-2">{submitErr}</p> : null}
             </div>
           </div>
         </section>
       ) : null}
 
-      {/* Main tab: Engine Room Layout */}
+      {/* Engine room layout */}
       {activeTab === "MAIN" ? (
         <section className="rounded border p-4 space-y-4">
           <h2 className="text-lg font-semibold">Engine Room Layout</h2>
-          <p className="text-sm text-gray-600">
-            Equipment is placed by location (ER - Port / ER - Center / ER - Stbd).
-          </p>
 
           <div className="grid gap-4 md:grid-cols-3">
-            {/* PORT */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Port</h3>
-
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Main Engines</h4>
                 <RunHoursList items={mePort} />
               </div>
-
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Generators</h4>
                 <RunHoursList items={dgPort} />
               </div>
             </div>
 
-            {/* CENTER */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Center</h3>
-
-              <div className="rounded border p-3 space-y-2">
-                <h4 className="text-sm font-semibold">Chiller Plant (Center-Top)</h4>
-                <p className="text-sm text-gray-600">
-                  Placeholder. Next step: seed 4 chillers + pumps and render water temps + toggles here.
-                </p>
-              </div>
-
+              <ChillerPlantCard />
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Center equipment (run-hours)</h4>
                 {[...meCenter, ...dgCenter].length ? <RunHoursList items={[...meCenter, ...dgCenter]} /> : <p className="text-sm text-gray-500">None</p>}
               </div>
             </div>
 
-            {/* STBD */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Starboard</h3>
-
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Main Engines</h4>
                 <RunHoursList items={meStbd} />
               </div>
-
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Generators</h4>
                 <RunHoursList items={dgStbd} />
@@ -662,31 +815,27 @@ export default function DailyLogClient({
       {/* Placeholder tabs */}
       {activeTab === "AHUS" ? (
         <TabShell code="AHUS" title="AHUs">
-          <p className="text-sm text-gray-700">Placeholder: up to 50 AHUs with Working/Tagged Out + Setpoint + Ambient temp.</p>
+          <p className="text-sm text-gray-700">Placeholder</p>
         </TabShell>
       ) : null}
-
       {activeTab === "BILGES" ? (
         <TabShell code="BILGES" title="Bilges">
-          <p className="text-sm text-gray-700">Placeholder: 4–12 bilge zones with Wet/Dry + Dirty/Clean toggle pairs.</p>
+          <p className="text-sm text-gray-700">Placeholder</p>
         </TabShell>
       ) : null}
-
       {activeTab === "TANKS" ? (
         <TabShell code="TANKS" title="Tanks">
-          <p className="text-sm text-gray-700">Placeholder: Fresh/Black/Grey + optional combined Grey/Black + Diesel onboard, all with L/gal.</p>
+          <p className="text-sm text-gray-700">Placeholder</p>
         </TabShell>
       ) : null}
-
       {activeTab === "ORB" ? (
         <TabShell code="ORB" title="Oil Record Book (ORB)">
-          <p className="text-sm text-gray-700">Placeholder: ORB entries required when fuel/oil/bilge events occur (trigger logic later).</p>
+          <p className="text-sm text-gray-700">Placeholder</p>
         </TabShell>
       ) : null}
-
       {activeTab === "RUNNING_LOG" ? (
         <TabShell code="RUNNING_LOG" title="Running Log">
-          <p className="text-sm text-gray-700">Required only when status is underway or anchor.</p>
+          <p className="text-sm text-gray-700">Placeholder</p>
         </TabShell>
       ) : null}
 
@@ -701,7 +850,6 @@ export default function DailyLogClient({
             value={defectTitle}
             disabled={saving || headerLocked}
             onChange={(e) => setDefectTitle(e.target.value)}
-            placeholder="e.g., Port DG seawater pump leak"
           />
         </label>
 
@@ -719,9 +867,7 @@ export default function DailyLogClient({
             Created defect <b>{defectOk}</b>
           </p>
         ) : null}
-        {defectErr ? (
-          <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{defectErr}</p>
-        ) : null}
+        {defectErr ? <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{defectErr}</p> : null}
       </section>
     </div>
   );
