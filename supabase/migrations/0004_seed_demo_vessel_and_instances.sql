@@ -82,9 +82,12 @@ et as (
 ),
 to_insert as (
   select * from (values
-    ('MAIN_ENGINE',         'DEMO: Main Engine 1',         'Propulsion',            'Engine Room'),
-    ('DIESEL_GENERATOR',    'DEMO: DG 1',                  'Electrical Generation', 'Engine Room'),
-    ('DIESEL_GENERATOR',    'DEMO: DG 2',                  'Electrical Generation', 'Engine Room'),
+   select * from (values
+  ('MAIN_ENGINE',         'DEMO: Main Engine 1',         'Propulsion',            'Engine Room'),
+  ('MAIN_ENGINE',         'DEMO: Main Engine 2',         'Propulsion',            'Engine Room'),
+  ('DIESEL_GENERATOR',    'DEMO: DG 1',                  'Electrical Generation', 'Engine Room'),
+  ('DIESEL_GENERATOR',    'DEMO: DG 2',                  'Electrical Generation', 'Engine Room'),
+  ...
     ('SHORE_POWER',         'DEMO: Shore Power',           'Electrical',            'Engine Room'),
     ('BATTERY_BANK',        'DEMO: Battery Bank',          'Electrical',            'Engine Room'),
     ('UPS_SYSTEM',          'DEMO: UPS',                   'Electrical',            'Bridge'),
