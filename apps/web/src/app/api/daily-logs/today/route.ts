@@ -1,51 +1,49 @@
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
-}
-
 export async function GET() {
-  const sb = supabaseServer();
+  const sb = await supabaseServer();
 
-  // Use latest-created vessel as "current" for MVP
+  // 1) Pick a "current" vessel: latest created
   const { data: vessel, error: vErr } = await sb
     .from("vessels")
-    .select("id,name,created_at")
+    .select("id")
     .order("created_at", { ascending: false })
     .limit(1)
-    .maybeSingle();
+    .single();
 
-  if (vErr) return NextResponse.json({ error: vErr.message }, { status: 500 });
-  if (!vessel) return NextResponse.json({ error: "No vessel found" }, { status: 404 });
+  if (vErr || !vessel?.id) {
+    return NextResponse.json({ error: vErr?.message ?? "No vessel found" }, { status: 500 });
+  }
 
-  const log_date = todayISO();
+  const vessel_id = vessel.id as string;
 
-  // Create if missing (idempotent)
-  // Ensure status is set to a known default on insert.
-  const { error: upErr } = await sb
+  // 2) Upsert today's daily log row
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const dd = String(today.getDate()).padStart(2, "0");
+  const log_date = `${yyyy}-${mm}-${dd}`;
+
+  // IMPORTANT:
+  // Do NOT include power_source here, or you might overwrite an existing saved value on conflict.
+  // Let DB default handle inserts; leave existing rows untouched.
+  const { data: upserted, error: uErr } = await sb
     .from("daily_logs")
     .upsert(
       {
-        vessel_id: vessel.id,
+        vessel_id,
         log_date,
         status: "dock",
       },
       { onConflict: "vessel_id,log_date" }
-    );
+    )
+    .select("id, vessel_id, log_date, status, location_text, notes, submitted_at, power_source")
+    .single();
 
-  if (upErr) return NextResponse.json({ error: upErr.message }, { status: 500 });
+  if (uErr || !upserted) {
+    return NextResponse.json({ error: uErr?.message ?? "Failed to upsert daily log" }, { status: 500 });
+  }
 
-  // Load today’s log with a stable field list (Step 3 needs these)
-  const { data: log, error: lErr } = await sb
-    .from("daily_logs")
-    .select("id,vessel_id,log_date,status,location_text,weather_text,notes,submitted_at")
-    .eq("vessel_id", vessel.id)
-    .eq("log_date", log_date)
-    .maybeSingle();
-
-  if (lErr) return NextResponse.json({ error: lErr.message }, { status: 500 });
-  if (!log) return NextResponse.json({ error: "Failed to load daily log" }, { status: 500 });
-
-  return NextResponse.json({ vessel, log });
+  return NextResponse.json({ log: upserted });
 }

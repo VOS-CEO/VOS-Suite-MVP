@@ -1,42 +1,118 @@
-export const dynamic = "force-dynamic";
-
-import DailyLogClient, { MeterTarget, ChillerPlantTarget } from "./DailyLogClient";
+import DailyLogClient from "./DailyLogClient";
 import { headers } from "next/headers";
 
-async function getBaseUrl() {
+// ---------- Types ----------
+type EquipmentItem = {
+  id: string;
+  display_name: string;
+  equipment_type?: { code?: string | null } | null;
+  location?: { name?: string | null } | null;
+};
+
+type TodayLog = {
+  id: string;
+  vessel_id: string;
+  status: string;
+  location_text?: string | null;
+  notes?: string | null;
+  submitted_at?: string | null;
+  power_source?: "SHORE" | "GENERATOR" | string | null;
+};
+
+type MeterTarget = {
+  equipmentId: string;
+  equipmentName: string;
+  runHoursFieldId: string;
+  locationName: string | null;
+};
+
+type ChillerPlantTarget =
+  | {
+      kind: "CHILLER";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: { RUNNING: string | null; TEMP_SUPPLY: string | null; TEMP_RETURN: string | null };
+    }
+  | {
+      kind: "CHW_SELECT" | "SW_SELECT";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: { SELECTED_PUMP: string | null };
+    };
+
+type PowerFieldIds = {
+  BUS_VOLTAGE: string | null;
+  BUS_FREQUENCY: string | null;
+  LOAD_PCT: string | null;
+};
+
+type PowerTarget =
+  | {
+      kind: "DG";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: PowerFieldIds;
+    }
+  | {
+      kind: "SHORE";
+      equipmentId: string;
+      equipmentName: string;
+      locationName: string | null;
+      fieldIds: PowerFieldIds;
+    };
+
+type PowerPanel = {
+  targets: PowerTarget[];
+  initialValuesByKey: Record<string, string>;
+};
+
+type UtilitiesPanel = {
+  fwSystem: {
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: { SELECTED_PUMP: string | null; FW_PRESSURE: string | null };
+  } | null;
+  circPump: {
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: { RUNNING: string | null };
+  } | null;
+  boilers: Array<{
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: { RUNNING: string | null; BOILER_TEMP: string | null };
+  }>;
+  initialValuesByKey: Record<string, string>;
+};
+
+// ---------- Helpers ----------
+async function getBaseUrl(): Promise<string> {
   const h = await headers();
   const host = h.get("host") ?? "localhost:3000";
   const proto = h.get("x-forwarded-proto") ?? "http";
   return `${proto}://${host}`;
 }
 
-async function getToday(baseUrl: string) {
-  const res = await fetch(`${baseUrl}/api/daily-logs/today`, { cache: "no-store" });
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<{
-    vessel: { id: string; name: string };
-    log: {
-      id: string;
-      status: string;
-      location_text?: string | null;
-      weather_text?: string | null;
-      notes?: string | null;
-      submitted_at?: string | null;
-    };
-  }>;
+  return (await res.json()) as T;
 }
 
-type EquipmentItem = {
-  id: string;
-  display_name: string;
-  equipment_type?: { code: string; name: string } | null;
-  location?: { id: string; name: string; parent_location_id?: string | null } | null;
-};
+async function getToday(baseUrl: string): Promise<{ log: TodayLog }> {
+  return await getJson<{ log: TodayLog }>(`${baseUrl}/api/daily-logs/today`);
+}
 
 async function getEquipmentList(baseUrl: string, vesselId: string): Promise<EquipmentItem[]> {
-  const res = await fetch(`${baseUrl}/api/em/equipment?vesselId=${vesselId}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(await res.text());
-  const json = await res.json();
+  const url = new URL(`${baseUrl}/api/em/equipment`);
+  url.searchParams.set("vesselId", vesselId);
+  const json = await getJson<{ items: EquipmentItem[] }>(url.toString());
   return (json.items ?? []) as EquipmentItem[];
 }
 
@@ -67,41 +143,37 @@ async function getSavedReading(
   return v as { num?: number; bool?: boolean; text?: string };
 }
 
+// ---------- Builders ----------
 async function buildRunHoursTargets(
   baseUrl: string,
   dailyLogId: string,
   equipment: EquipmentItem[],
-  typeCode: "MAIN_ENGINE" | "DIESEL_GENERATOR"
+  typeCode: string
 ): Promise<{ targets: MeterTarget[]; initialHoursByEquipmentId: Record<string, number | null> }> {
-  const items = equipment
+  const rows = equipment
     .filter((e) => (e.equipment_type?.code ?? "") === typeCode)
     .sort((a, b) => a.display_name.localeCompare(b.display_name));
 
-  if (items.length === 0) throw new Error(`No ${typeCode} equipment found (seed missing?)`);
+  const initialHoursByEquipmentId: Record<string, number | null> = {};
+  const targets: MeterTarget[] = [];
 
-  const targets: MeterTarget[] = await Promise.all(
-    items.map(async (eq) => {
-      const fields = await getFieldIds(baseUrl, eq.id);
-      const runHoursFieldId = fields["RUN_HOURS"];
-      if (!runHoursFieldId) throw new Error(`RUN_HOURS field not found for ${eq.display_name}`);
-      return {
-        equipmentId: eq.id,
-        equipmentName: eq.display_name,
-        runHoursFieldId,
-        locationName: eq.location?.name ?? null,
-      };
-    })
-  );
+  for (const eq of rows) {
+    const fields = await getFieldIds(baseUrl, eq.id);
+    const runHoursFieldId = fields["RUN_HOURS"];
+    if (!runHoursFieldId) continue;
 
-  const entries = await Promise.all(
-    targets.map(async (t) => {
-      const v = await getSavedReading(baseUrl, dailyLogId, t.equipmentId, t.runHoursFieldId);
-      const num = typeof v?.num === "number" ? v.num : null;
-      return [t.equipmentId, num] as const;
-    })
-  );
+    targets.push({
+      equipmentId: eq.id,
+      equipmentName: eq.display_name,
+      runHoursFieldId,
+      locationName: eq.location?.name ?? null,
+    });
 
-  return { targets, initialHoursByEquipmentId: Object.fromEntries(entries) as Record<string, number | null> };
+    const v = await getSavedReading(baseUrl, dailyLogId, eq.id, runHoursFieldId);
+    initialHoursByEquipmentId[eq.id] = typeof v?.num === "number" ? v.num : null;
+  }
+
+  return { targets, initialHoursByEquipmentId };
 }
 
 async function buildChillerPlantTargets(
@@ -139,7 +211,6 @@ async function buildChillerPlantTargets(
         fieldIds: { RUNNING: running, TEMP_SUPPLY: ts, TEMP_RETURN: tr },
       };
 
-      // preload readings
       if (running) {
         const v = await getSavedReading(baseUrl, dailyLogId, eq.id, running);
         initialValuesByKey[`${eq.id}:${running}`] = typeof v?.bool === "boolean" ? (v.bool ? "true" : "false") : "false";
@@ -181,20 +252,156 @@ async function buildChillerPlantTargets(
   return { chillers, chwPumps, swPumps, initialValuesByKey };
 }
 
+async function buildPowerTargets(
+  baseUrl: string,
+  dailyLogId: string,
+  equipment: EquipmentItem[]
+): Promise<PowerPanel> {
+  const isDG = (e: EquipmentItem) => (e.equipment_type?.code ?? "") === "DIESEL_GENERATOR";
+  const isShore = (e: EquipmentItem) => (e.equipment_type?.code ?? "") === "SHORE_POWER";
+
+  const dgRaw = equipment.filter(isDG).sort((a, b) => a.display_name.localeCompare(b.display_name));
+  const shoreRaw = equipment.filter(isShore).sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  const initialValuesByKey: Record<string, string> = {};
+
+  const buildOne = async (eq: EquipmentItem, kind: "DG" | "SHORE"): Promise<PowerTarget> => {
+    const fields = await getFieldIds(baseUrl, eq.id);
+
+    const vId = fields["BUS_VOLTAGE"] ?? null;
+    const fId = fields["BUS_FREQUENCY"] ?? null;
+    const lId = fields["LOAD_PCT"] ?? null;
+
+    const t: PowerTarget = {
+      kind,
+      equipmentId: eq.id,
+      equipmentName: eq.display_name,
+      locationName: eq.location?.name ?? null,
+      fieldIds: { BUS_VOLTAGE: vId, BUS_FREQUENCY: fId, LOAD_PCT: lId },
+    };
+
+    const preloadNum = async (fieldId: string) => {
+      const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fieldId);
+      initialValuesByKey[`${eq.id}:${fieldId}`] = typeof v?.num === "number" ? String(v.num) : "";
+    };
+
+    if (vId) await preloadNum(vId);
+    if (fId) await preloadNum(fId);
+    if (lId) await preloadNum(lId);
+
+    return t;
+  };
+
+  const dgTargets = await Promise.all(dgRaw.map((eq) => buildOne(eq, "DG")));
+  const shoreTargets = await Promise.all(shoreRaw.map((eq) => buildOne(eq, "SHORE")));
+
+  return { targets: [...dgTargets, ...shoreTargets], initialValuesByKey };
+}
+
+async function buildUtilitiesPanel(
+  baseUrl: string,
+  dailyLogId: string,
+  equipment: EquipmentItem[]
+): Promise<UtilitiesPanel> {
+  const initialValuesByKey: Record<string, string> = {};
+
+  const fwEq = equipment.find((e) => (e.equipment_type?.code ?? "") === "FRESH_WATER_PUMPS") ?? null;
+  const circEq = equipment.find((e) => (e.equipment_type?.code ?? "") === "HOT_WATER_CIRC_PUMP") ?? null;
+  const boilerEqs = equipment
+    .filter((e) => (e.equipment_type?.code ?? "") === "BOILER")
+    .sort((a, b) => a.display_name.localeCompare(b.display_name));
+
+  const fwSystem = fwEq
+    ? await (async () => {
+        const fields = await getFieldIds(baseUrl, fwEq.id);
+        const sel = fields["SELECTED_PUMP"] ?? null;
+        const pr = fields["FW_PRESSURE"] ?? null;
+
+        if (sel) {
+          const v = await getSavedReading(baseUrl, dailyLogId, fwEq.id, sel);
+          initialValuesByKey[`${fwEq.id}:${sel}`] = typeof v?.text === "string" ? v.text : "NONE";
+        }
+        if (pr) {
+          const v = await getSavedReading(baseUrl, dailyLogId, fwEq.id, pr);
+          initialValuesByKey[`${fwEq.id}:${pr}`] = typeof v?.num === "number" ? String(v.num) : "";
+        }
+
+        return {
+          equipmentId: fwEq.id,
+          equipmentName: fwEq.display_name,
+          locationName: fwEq.location?.name ?? null,
+          fieldIds: { SELECTED_PUMP: sel, FW_PRESSURE: pr },
+        };
+      })()
+    : null;
+
+  const circPump = circEq
+    ? await (async () => {
+        const fields = await getFieldIds(baseUrl, circEq.id);
+        const run = fields["RUNNING"] ?? null;
+
+        if (run) {
+          const v = await getSavedReading(baseUrl, dailyLogId, circEq.id, run);
+          initialValuesByKey[`${circEq.id}:${run}`] = typeof v?.bool === "boolean" ? (v.bool ? "true" : "false") : "false";
+        }
+
+        return {
+          equipmentId: circEq.id,
+          equipmentName: circEq.display_name,
+          locationName: circEq.location?.name ?? null,
+          fieldIds: { RUNNING: run },
+        };
+      })()
+    : null;
+
+  const boilers = await Promise.all(
+    boilerEqs.map(async (eq) => {
+      const fields = await getFieldIds(baseUrl, eq.id);
+      const run = fields["RUNNING"] ?? null;
+      const tmp = fields["BOILER_TEMP"] ?? null;
+
+      if (run) {
+        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, run);
+        initialValuesByKey[`${eq.id}:${run}`] = typeof v?.bool === "boolean" ? (v.bool ? "true" : "false") : "false";
+      }
+      if (tmp) {
+        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, tmp);
+        initialValuesByKey[`${eq.id}:${tmp}`] = typeof v?.num === "number" ? String(v.num) : "";
+      }
+
+      return {
+        equipmentId: eq.id,
+        equipmentName: eq.display_name,
+        locationName: eq.location?.name ?? null,
+        fieldIds: { RUNNING: run, BOILER_TEMP: tmp },
+      };
+    })
+  );
+
+  return { fwSystem, circPump, boilers, initialValuesByKey };
+}
+
+// ---------- Page ----------
 export default async function DailyLogPage() {
   const baseUrl = await getBaseUrl();
 
-  const { vessel, log } = await getToday(baseUrl);
-  const equipment = await getEquipmentList(baseUrl, vessel.id);
+  const { log } = await getToday(baseUrl);
+  const vesselId = log.vessel_id;
+
+  const equipment = await getEquipmentList(baseUrl, vesselId);
 
   const [
     { targets: mainEngines, initialHoursByEquipmentId: meHours },
     { targets: dieselGens, initialHoursByEquipmentId: dgHours },
     chillerPlant,
+    powerPanel,
+    utilitiesPanel,
   ] = await Promise.all([
     buildRunHoursTargets(baseUrl, log.id, equipment, "MAIN_ENGINE"),
     buildRunHoursTargets(baseUrl, log.id, equipment, "DIESEL_GENERATOR"),
     buildChillerPlantTargets(baseUrl, log.id, equipment),
+    buildPowerTargets(baseUrl, log.id, equipment),
+    buildUtilitiesPanel(baseUrl, log.id, equipment),
   ]);
 
   const initialHoursByEquipmentId: Record<string, number | null> = { ...meHours, ...dgHours };
@@ -202,19 +409,21 @@ export default async function DailyLogPage() {
   return (
     <main className="p-6 space-y-4">
       <h1 className="text-2xl font-semibold">S06 — Daily Log</h1>
-      <p className="text-sm text-gray-600">Vessel: {vessel.name}</p>
+      <p className="text-sm text-gray-600">Vessel: {vesselId}</p>
 
       <DailyLogClient
         dailyLogId={log.id}
-        status={log.status ?? "dock"}
+        status={log.status}
         locationText={log.location_text ?? ""}
-        weatherText={log.weather_text ?? ""}
+        powerSource={log.power_source === "GENERATOR" ? "GENERATOR" : "SHORE"}
         notes={log.notes ?? ""}
         submittedAt={log.submitted_at ?? null}
         mainEngines={mainEngines}
         dieselGens={dieselGens}
         initialHoursByEquipmentId={initialHoursByEquipmentId}
         chillerPlant={chillerPlant}
+        powerPanel={powerPanel}
+        utilitiesPanel={utilitiesPanel}
       />
     </main>
   );
