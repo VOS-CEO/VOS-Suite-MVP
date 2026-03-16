@@ -91,6 +91,35 @@ type UtilitiesPanel = {
   initialValuesByKey: Record<string, string>;
 };
 
+type WatermakerPanel = {
+  items: Array<{
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: {
+      RUN_HOURS: string | null;
+      PUMP_STATUS: string | null;
+      WATER_PPM: string | null;
+      WATER_LPH: string | null;
+      WM_DAYS_SINCE_FLUSH: string | null;
+    };
+  }>;
+  initialValuesByKey: Record<string, string>;
+};
+
+type BatteryPanel = {
+  items: Array<{
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: {
+      BANK_VOLTAGE: string | null;
+      BANK_SOC: string | null;
+    };
+  }>;
+  initialValuesByKey: Record<string, string>;
+};
+
 // ---------- Helpers ----------
 async function getBaseUrl(): Promise<string> {
   const h = await headers();
@@ -211,18 +240,18 @@ async function buildChillerPlantTargets(
         fieldIds: { RUNNING: running, TEMP_SUPPLY: ts, TEMP_RETURN: tr },
       };
 
-      if (running) {
-        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, running);
-        initialValuesByKey[`${eq.id}:${running}`] = typeof v?.bool === "boolean" ? (v.bool ? "true" : "false") : "false";
-      }
-      if (ts) {
-        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, ts);
-        initialValuesByKey[`${eq.id}:${ts}`] = typeof v?.num === "number" ? String(v.num) : "";
-      }
-      if (tr) {
-        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, tr);
-        initialValuesByKey[`${eq.id}:${tr}`] = typeof v?.num === "number" ? String(v.num) : "";
-      }
+      const preloadBool = async (fid: string) => {
+        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fid);
+        initialValuesByKey[`${eq.id}:${fid}`] = typeof v?.bool === "boolean" ? (v.bool ? "true" : "false") : "false";
+      };
+      const preloadNum = async (fid: string) => {
+        const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fid);
+        initialValuesByKey[`${eq.id}:${fid}`] = typeof v?.num === "number" ? String(v.num) : "";
+      };
+
+      if (running) await preloadBool(running);
+      if (ts) await preloadNum(ts);
+      if (tr) await preloadNum(tr);
 
       return t;
     })
@@ -252,11 +281,7 @@ async function buildChillerPlantTargets(
   return { chillers, chwPumps, swPumps, initialValuesByKey };
 }
 
-async function buildPowerTargets(
-  baseUrl: string,
-  dailyLogId: string,
-  equipment: EquipmentItem[]
-): Promise<PowerPanel> {
+async function buildPowerTargets(baseUrl: string, dailyLogId: string, equipment: EquipmentItem[]): Promise<PowerPanel> {
   const isDG = (e: EquipmentItem) => (e.equipment_type?.code ?? "") === "DIESEL_GENERATOR";
   const isShore = (e: EquipmentItem) => (e.equipment_type?.code ?? "") === "SHORE_POWER";
 
@@ -272,24 +297,22 @@ async function buildPowerTargets(
     const fId = fields["BUS_FREQUENCY"] ?? null;
     const lId = fields["LOAD_PCT"] ?? null;
 
-    const t: PowerTarget = {
-      kind,
-      equipmentId: eq.id,
-      equipmentName: eq.display_name,
-      locationName: eq.location?.name ?? null,
-      fieldIds: { BUS_VOLTAGE: vId, BUS_FREQUENCY: fId, LOAD_PCT: lId },
-    };
-
-    const preloadNum = async (fieldId: string) => {
-      const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fieldId);
-      initialValuesByKey[`${eq.id}:${fieldId}`] = typeof v?.num === "number" ? String(v.num) : "";
+    const preloadNum = async (fid: string) => {
+      const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fid);
+      initialValuesByKey[`${eq.id}:${fid}`] = typeof v?.num === "number" ? String(v.num) : "";
     };
 
     if (vId) await preloadNum(vId);
     if (fId) await preloadNum(fId);
     if (lId) await preloadNum(lId);
 
-    return t;
+    return {
+      kind,
+      equipmentId: eq.id,
+      equipmentName: eq.display_name,
+      locationName: eq.location?.name ?? null,
+      fieldIds: { BUS_VOLTAGE: vId, BUS_FREQUENCY: fId, LOAD_PCT: lId },
+    };
   };
 
   const dgTargets = await Promise.all(dgRaw.map((eq) => buildOne(eq, "DG")));
@@ -298,11 +321,7 @@ async function buildPowerTargets(
   return { targets: [...dgTargets, ...shoreTargets], initialValuesByKey };
 }
 
-async function buildUtilitiesPanel(
-  baseUrl: string,
-  dailyLogId: string,
-  equipment: EquipmentItem[]
-): Promise<UtilitiesPanel> {
+async function buildUtilitiesPanel(baseUrl: string, dailyLogId: string, equipment: EquipmentItem[]): Promise<UtilitiesPanel> {
   const initialValuesByKey: Record<string, string> = {};
 
   const fwEq = equipment.find((e) => (e.equipment_type?.code ?? "") === "FRESH_WATER_PUMPS") ?? null;
@@ -381,6 +400,91 @@ async function buildUtilitiesPanel(
   return { fwSystem, circPump, boilers, initialValuesByKey };
 }
 
+async function buildWatermakerPanel(baseUrl: string, dailyLogId: string, equipment: EquipmentItem[]): Promise<WatermakerPanel> {
+  const initialValuesByKey: Record<string, string> = {};
+
+  const items = await Promise.all(
+    equipment
+      .filter((e) => (e.equipment_type?.code ?? "") === "WATERMAKER")
+      .sort((a, b) => a.display_name.localeCompare(b.display_name))
+      .map(async (eq) => {
+        const fields = await getFieldIds(baseUrl, eq.id);
+
+        const runHours = fields["RUN_HOURS"] ?? null;
+        const pumpStatus = fields["PUMP_STATUS"] ?? null;
+        const waterPpm = fields["WATER_PPM"] ?? null;
+        const waterLph = fields["WATER_LPH"] ?? null;
+        const flushDays = fields["WM_DAYS_SINCE_FLUSH"] ?? null;
+
+        const preloadNum = async (fieldId: string) => {
+          const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fieldId);
+          initialValuesByKey[`${eq.id}:${fieldId}`] = typeof v?.num === "number" ? String(v.num) : "";
+        };
+        const preloadText = async (fieldId: string, fallback = "") => {
+          const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fieldId);
+          initialValuesByKey[`${eq.id}:${fieldId}`] = typeof v?.text === "string" ? v.text : fallback;
+        };
+
+        if (runHours) await preloadNum(runHours);
+        if (pumpStatus) await preloadText(pumpStatus, "");
+        if (waterPpm) await preloadNum(waterPpm);
+        if (waterLph) await preloadNum(waterLph);
+        if (flushDays) await preloadNum(flushDays);
+
+        return {
+          equipmentId: eq.id,
+          equipmentName: eq.display_name,
+          locationName: eq.location?.name ?? null,
+          fieldIds: {
+            RUN_HOURS: runHours,
+            PUMP_STATUS: pumpStatus,
+            WATER_PPM: waterPpm,
+            WATER_LPH: waterLph,
+            WM_DAYS_SINCE_FLUSH: flushDays,
+          },
+        };
+      })
+  );
+
+  return { items, initialValuesByKey };
+}
+
+async function buildBatteryPanel(baseUrl: string, dailyLogId: string, equipment: EquipmentItem[]): Promise<BatteryPanel> {
+  const initialValuesByKey: Record<string, string> = {};
+
+  const items = await Promise.all(
+    equipment
+      .filter((e) => (e.equipment_type?.code ?? "") === "BATTERY_BANK")
+      .sort((a, b) => a.display_name.localeCompare(b.display_name))
+      .map(async (eq) => {
+        const fields = await getFieldIds(baseUrl, eq.id);
+
+        const bankVoltage = fields["BANK_VOLTAGE"] ?? null;
+        const bankSoc = fields["BANK_SOC"] ?? null;
+
+        const preloadNum = async (fieldId: string) => {
+          const v = await getSavedReading(baseUrl, dailyLogId, eq.id, fieldId);
+          initialValuesByKey[`${eq.id}:${fieldId}`] = typeof v?.num === "number" ? String(v.num) : "";
+        };
+
+        if (bankVoltage) await preloadNum(bankVoltage);
+        if (bankSoc) await preloadNum(bankSoc);
+
+        return {
+          equipmentId: eq.id,
+          equipmentName: eq.display_name,
+          locationName: eq.location?.name ?? null,
+          fieldIds: {
+            BANK_VOLTAGE: bankVoltage,
+            BANK_SOC: bankSoc,
+          },
+        };
+      })
+  );
+
+  return { items, initialValuesByKey };
+}
+
 // ---------- Page ----------
 export default async function DailyLogPage() {
   const baseUrl = await getBaseUrl();
@@ -396,12 +500,16 @@ export default async function DailyLogPage() {
     chillerPlant,
     powerPanel,
     utilitiesPanel,
+    watermakerPanel,
+    batteryPanel,
   ] = await Promise.all([
     buildRunHoursTargets(baseUrl, log.id, equipment, "MAIN_ENGINE"),
     buildRunHoursTargets(baseUrl, log.id, equipment, "DIESEL_GENERATOR"),
     buildChillerPlantTargets(baseUrl, log.id, equipment),
     buildPowerTargets(baseUrl, log.id, equipment),
     buildUtilitiesPanel(baseUrl, log.id, equipment),
+    buildWatermakerPanel(baseUrl, log.id, equipment),
+    buildBatteryPanel(baseUrl, log.id, equipment),
   ]);
 
   const initialHoursByEquipmentId: Record<string, number | null> = { ...meHours, ...dgHours };
@@ -424,6 +532,8 @@ export default async function DailyLogPage() {
         chillerPlant={chillerPlant}
         powerPanel={powerPanel}
         utilitiesPanel={utilitiesPanel}
+        watermakerPanel={watermakerPanel}
+        batteryPanel={batteryPanel}
       />
     </main>
   );

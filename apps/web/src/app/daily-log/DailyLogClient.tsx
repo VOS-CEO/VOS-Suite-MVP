@@ -1,29 +1,12 @@
+// apps/web/src/app/daily-log/DailyLogClient.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
 
 type JsonObject = Record<string, unknown>;
-
 function isObject(v: unknown): v is JsonObject {
   return typeof v === "object" && v !== null;
 }
-
-function getErrorMessage(json: unknown, fallback: string): string {
-  if (isObject(json) && "error" in json) {
-    const e = json.error;
-    if (typeof e === "string") return e;
-  }
-  return fallback;
-}
-
-function getDefectNo(json: unknown): string {
-  if (!isObject(json) || !("defect" in json)) return "";
-  const defect = json.defect;
-  if (!isObject(defect) || !("defect_no" in defect)) return "";
-  const dn = defect.defect_no;
-  return typeof dn === "string" ? dn : "";
-}
-
 async function safeReadJson(res: Response): Promise<unknown> {
   const text = await res.text();
   if (!text) return {};
@@ -32,6 +15,20 @@ async function safeReadJson(res: Response): Promise<unknown> {
   } catch {
     return { error: text };
   }
+}
+function getErrorMessage(json: unknown, fallback: string): string {
+  if (isObject(json) && "error" in json) {
+    const e = json.error;
+    if (typeof e === "string") return e;
+  }
+  return fallback;
+}
+function getDefectNo(json: unknown): string {
+  if (!isObject(json) || !("defect" in json)) return "";
+  const defect = json.defect;
+  if (!isObject(defect) || !("defect_no" in defect)) return "";
+  const dn = defect.defect_no;
+  return typeof dn === "string" ? dn : "";
 }
 
 export type MeterTarget = {
@@ -68,6 +65,7 @@ function isSwSelect(x: ChillerPlantTarget | null): x is Extract<ChillerPlantTarg
 }
 
 type PowerSource = "SHORE" | "GENERATOR";
+type MeterValue = { num?: number; bool?: boolean; text?: string };
 
 type PowerPanel = {
   targets: Array<{
@@ -102,8 +100,33 @@ type UtilitiesPanel = {
   initialValuesByKey: Record<string, string>;
 };
 
-type TabCode = "MAIN" | "AHUS" | "BILGES" | "TANKS" | "ORB" | "RUNNING_LOG";
+type WatermakerPanel = {
+  items: Array<{
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: {
+      RUN_HOURS: string | null;
+      PUMP_STATUS: string | null;
+      WATER_PPM: string | null;
+      WATER_LPH: string | null;
+      WM_DAYS_SINCE_FLUSH: string | null;
+    };
+  }>;
+  initialValuesByKey: Record<string, string>;
+};
 
+type BatteryPanel = {
+  items: Array<{
+    equipmentId: string;
+    equipmentName: string;
+    locationName: string | null;
+    fieldIds: { BANK_VOLTAGE: string | null; BANK_SOC: string | null };
+  }>;
+  initialValuesByKey: Record<string, string>;
+};
+
+type TabCode = "MAIN" | "AHUS" | "BILGES" | "TANKS" | "ORB" | "RUNNING_LOG";
 const TABS: Array<{ code: TabCode; label: string }> = [
   { code: "MAIN", label: "Main" },
   { code: "AHUS", label: "AHUs" },
@@ -113,6 +136,8 @@ const TABS: Array<{ code: TabCode; label: string }> = [
   { code: "RUNNING_LOG", label: "Running Log" },
 ];
 
+type TabStateRow = { tab_code: TabCode; viewed_at: string | null; ok_at: string | null };
+
 function requiresRunningLog(status: string | null | undefined) {
   const s = String(status ?? "").toLowerCase();
   return s === "underway" || s === "anchor";
@@ -120,8 +145,6 @@ function requiresRunningLog(status: string | null | undefined) {
 function requiresORB() {
   return false;
 }
-
-type TabStateRow = { tab_code: TabCode; viewed_at: string | null; ok_at: string | null };
 
 function sideFromLocationName(name: string | null): "PORT" | "CENTER" | "STBD" {
   const n = String(name ?? "").toLowerCase();
@@ -131,8 +154,17 @@ function sideFromLocationName(name: string | null): "PORT" | "CENTER" | "STBD" {
   if (n.includes("engine room")) return "CENTER";
   return "CENTER";
 }
-
-type MeterValue = { num?: number; bool?: boolean; text?: string };
+function orderBatteryBanks(aName: string, bName: string) {
+  const a = aName.toLowerCase();
+  const b = bName.toLowerCase();
+  const aME = a.includes("main engine");
+  const bME = b.includes("main engine");
+  if (aME !== bME) return aME ? -1 : 1;
+  const aDG = a.includes("dg");
+  const bDG = b.includes("dg");
+  if (aDG !== bDG) return aDG ? -1 : 1;
+  return aName.localeCompare(bName);
+}
 
 export default function DailyLogClient({
   dailyLogId,
@@ -147,6 +179,8 @@ export default function DailyLogClient({
   chillerPlant,
   powerPanel,
   utilitiesPanel,
+  watermakerPanel,
+  batteryPanel,
 }: {
   dailyLogId: string;
   status?: string | null;
@@ -165,29 +199,25 @@ export default function DailyLogClient({
   };
   powerPanel: PowerPanel;
   utilitiesPanel: UtilitiesPanel;
+  watermakerPanel: WatermakerPanel;
+  batteryPanel: BatteryPanel;
 }) {
   const allTargets = useMemo(() => [...mainEngines, ...dieselGens], [mainEngines, dieselGens]);
+
   const [activeTab, setActiveTab] = useState<TabCode>("MAIN");
 
-  // Operational Context
   const [status, setStatus] = useState<string>(String(initialStatus ?? "dock"));
   const [locationText, setLocationText] = useState<string>(initialLocationText ?? "");
   const [powerSource, setPowerSource] = useState<PowerSource>(initialPowerSource === "GENERATOR" ? "GENERATOR" : "SHORE");
-
-  // Notes at bottom
   const [notes, setNotes] = useState<string>(initialNotes ?? "");
 
   const headerLocked = !!submittedAt;
 
-  // Header feedback (Operational Context + Notes)
   const [headerOk, setHeaderOk] = useState<string | null>(null);
   const [headerErr, setHeaderErr] = useState<string | null>(null);
-
-  // Engine Room feedback
   const [engineOk, setEngineOk] = useState<string | null>(null);
   const [engineErr, setEngineErr] = useState<string | null>(null);
 
-  // Tabs state
   const [tabState, setTabState] = useState<Record<TabCode, { viewed: boolean; ok: boolean }>>({
     MAIN: { viewed: true, ok: true },
     AHUS: { viewed: false, ok: false },
@@ -201,7 +231,6 @@ export default function DailyLogClient({
 
   const [saving, setSaving] = useState(false);
 
-  // ME/DG hours values (no per-card save)
   const [hoursById, setHoursById] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
     for (const t of allTargets) {
@@ -211,26 +240,24 @@ export default function DailyLogClient({
     return init;
   });
 
-  // Chiller plant values
   const [cpValues, setCpValues] = useState<Record<string, string>>(() => ({ ...chillerPlant.initialValuesByKey }));
-
-  // Power values
   const [powerValues, setPowerValues] = useState<Record<string, string>>(() => ({ ...powerPanel.initialValuesByKey }));
-
-  // Utilities values
   const [utilValues, setUtilValues] = useState<Record<string, string>>(() => ({ ...utilitiesPanel.initialValuesByKey }));
+  const [watermakerValues, setWatermakerValues] = useState<Record<string, string>>(() => ({ ...watermakerPanel.initialValuesByKey }));
+  const [batteryValues, setBatteryValues] = useState<Record<string, string>>(() => ({ ...batteryPanel.initialValuesByKey }));
 
-  // Power “running” checkboxes (per instance)
   const [activePowerEquipIds, setActivePowerEquipIds] = useState<string[]>([]);
 
-  // Defects
   const [defectTitle, setDefectTitle] = useState("");
   const [defectOk, setDefectOk] = useState<string | null>(null);
   const [defectErr, setDefectErr] = useState<string | null>(null);
 
-  // Submit
   const [submitOk, setSubmitOk] = useState<string | null>(null);
   const [submitErr, setSubmitErr] = useState<string | null>(null);
+
+  // Inline notifications (MVP)
+  const [notifDismissed, setNotifDismissed] = useState<Record<string, boolean>>({});
+  const [notifOpen, setNotifOpen] = useState(false);
 
   const runningLogRequired = requiresRunningLog(status);
   const orbRequired = requiresORB();
@@ -260,7 +287,8 @@ export default function DailyLogClient({
       const json: unknown = await safeReadJson(res);
       if (!res.ok) throw new Error(getErrorMessage(json, "Failed to load tab state"));
 
-      const rows = (isObject(json) && Array.isArray(json.items) ? (json.items as TabStateRow[]) : []) ?? [];
+const rows: TabStateRow[] =
+  isObject(json) && "items" in json && Array.isArray(json.items) ? (json.items as TabStateRow[]) : [];
       const next: Record<TabCode, { viewed: boolean; ok: boolean }> = {
         MAIN: { viewed: true, ok: true },
         AHUS: { viewed: false, ok: false },
@@ -360,22 +388,6 @@ export default function DailyLogClient({
 
       const json: unknown = await safeReadJson(res);
       if (!res.ok) throw new Error(getErrorMessage(json, "Failed to save operational context"));
-
-      if (isObject(json) && "log" in json && isObject(json.log)) {
-        const log = json.log as Record<string, unknown>;
-        if (typeof log.status === "string") setStatus(log.status);
-        if (typeof log.location_text === "string" || log.location_text === null) {
-          setLocationText((log.location_text as string | null) ?? "");
-        }
-        if (typeof log.notes === "string" || log.notes === null) {
-          setNotes((log.notes as string | null) ?? "");
-        }
-        if (typeof log.power_source === "string") {
-          const ps = log.power_source.toUpperCase();
-          setPowerSource(ps === "GENERATOR" ? "GENERATOR" : "SHORE");
-        }
-      }
-
       setHeaderOk("Saved");
     } catch (e: unknown) {
       setHeaderErr(e instanceof Error ? e.message : "Failed to save operational context");
@@ -400,10 +412,17 @@ export default function DailyLogClient({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       cache: "no-store",
-      body: JSON.stringify({ equipmentId, fieldId, hours }), // legacy support
+      body: JSON.stringify({ equipmentId, fieldId, hours }),
     });
     const json: unknown = await safeReadJson(res);
     if (!res.ok) throw new Error(getErrorMessage(json, "Failed to save hours"));
+  }
+
+  function setWatermakerValue(key: string, value: string) {
+    setWatermakerValues((prev) => ({ ...prev, [key]: value }));
+  }
+  function setBatteryValue(key: string, value: string) {
+    setBatteryValues((prev) => ({ ...prev, [key]: value }));
   }
 
   async function saveEngineRoom() {
@@ -419,7 +438,7 @@ export default function DailyLogClient({
 
     setSaving(true);
     try {
-      // 1) ME + DG hours (all non-empty)
+      // 1) ME + DG hours
       for (const t of allTargets) {
         const raw = (hoursById[t.equipmentId] ?? "").trim();
         if (!raw) continue;
@@ -428,7 +447,7 @@ export default function DailyLogClient({
         await postHours(t.equipmentId, t.runHoursFieldId, n);
       }
 
-      // 2) Power panel (only ticked sources, and only current source kind)
+      // 2) Power panel
       const visibleKind = powerSource === "GENERATOR" ? "DG" : "SHORE";
       const visible = (powerPanel.targets ?? []).filter((t) => t.kind === visibleKind);
       const runningSet = new Set(activePowerEquipIds);
@@ -447,7 +466,7 @@ export default function DailyLogClient({
 
         if (t.fieldIds.BUS_VOLTAGE) await saveNumIf(t.fieldIds.BUS_VOLTAGE, "V");
         if (t.fieldIds.BUS_FREQUENCY) await saveNumIf(t.fieldIds.BUS_FREQUENCY, "Hz");
-        if (t.fieldIds.LOAD_PCT) await saveNumIf(t.fieldIds.LOAD_PCT, "pct");
+        if (t.fieldIds.LOAD_PCT) await saveNumIf(t.fieldIds.LOAD_PCT, "%");
       }
 
       // 3) Chiller selectors
@@ -467,7 +486,7 @@ export default function DailyLogClient({
         await postMeterReading(sw.equipmentId, fid, { text: v }, null);
       }
 
-      // 4) Chillers (running + temps)
+      // 4) Chillers
       for (const c of (chillerPlant.chillers ?? []).filter(isChiller)) {
         const runId = c.fieldIds.RUNNING;
         const tsId = c.fieldIds.TEMP_SUPPLY;
@@ -492,7 +511,7 @@ export default function DailyLogClient({
         if (trId) await saveTempIf(trId);
       }
 
-      // 5) Fresh water system (SELECTED_PUMP + FW_PRESSURE)
+      // 5) Fresh water system
       const fw = utilitiesPanel.fwSystem;
       if (fw) {
         const selId = fw.fieldIds.SELECTED_PUMP;
@@ -513,7 +532,7 @@ export default function DailyLogClient({
         }
       }
 
-      // 6) Circ pump RUNNING
+      // 6) Circ pump
       const circ = utilitiesPanel.circPump;
       if (circ && circ.fieldIds.RUNNING) {
         const fid = circ.fieldIds.RUNNING;
@@ -522,7 +541,7 @@ export default function DailyLogClient({
         await postMeterReading(circ.equipmentId, fid, { bool: b }, null);
       }
 
-      // 7) Boilers (RUNNING always; TEMP only if running)
+      // 7) Boilers
       for (const b of utilitiesPanel.boilers ?? []) {
         const runId = b.fieldIds.RUNNING;
         const tmpId = b.fieldIds.BOILER_TEMP;
@@ -540,6 +559,69 @@ export default function DailyLogClient({
           if (raw) {
             const n = Number(raw);
             if (!Number.isNaN(n)) await postMeterReading(b.equipmentId, tmpId, { num: n }, "C");
+          }
+        }
+      }
+
+      // 8) Watermakers
+      for (const item of watermakerPanel.items) {
+        const runHoursId = item.fieldIds.RUN_HOURS;
+        const pumpStatusId = item.fieldIds.PUMP_STATUS;
+        const waterPpmId = item.fieldIds.WATER_PPM;
+        const waterLphId = item.fieldIds.WATER_LPH;
+        const flushDaysId = item.fieldIds.WM_DAYS_SINCE_FLUSH;
+
+        if (runHoursId) {
+          const raw = String(watermakerValues[`${item.equipmentId}:${runHoursId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postHours(item.equipmentId, runHoursId, n);
+          }
+        }
+        if (pumpStatusId) {
+          const raw = String(watermakerValues[`${item.equipmentId}:${pumpStatusId}`] ?? "").trim();
+          if (raw) await postMeterReading(item.equipmentId, pumpStatusId, { text: raw }, null);
+        }
+        if (waterPpmId) {
+          const raw = String(watermakerValues[`${item.equipmentId}:${waterPpmId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postMeterReading(item.equipmentId, waterPpmId, { num: n }, "ppm");
+          }
+        }
+        if (waterLphId) {
+          const raw = String(watermakerValues[`${item.equipmentId}:${waterLphId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postMeterReading(item.equipmentId, waterLphId, { num: n }, "L/h");
+          }
+        }
+        if (flushDaysId) {
+          const raw = String(watermakerValues[`${item.equipmentId}:${flushDaysId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postMeterReading(item.equipmentId, flushDaysId, { num: n }, "days");
+          }
+        }
+      }
+
+      // 9) Battery banks
+      for (const item of batteryPanel.items) {
+        const voltageId = item.fieldIds.BANK_VOLTAGE;
+        const socId = item.fieldIds.BANK_SOC;
+
+        if (voltageId) {
+          const raw = String(batteryValues[`${item.equipmentId}:${voltageId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postMeterReading(item.equipmentId, voltageId, { num: n }, "V");
+          }
+        }
+        if (socId) {
+          const raw = String(batteryValues[`${item.equipmentId}:${socId}`] ?? "").trim();
+          if (raw) {
+            const n = Number(raw);
+            if (!Number.isNaN(n)) await postMeterReading(item.equipmentId, socId, { num: n }, "%");
           }
         }
       }
@@ -663,198 +745,20 @@ export default function DailyLogClient({
     );
   }
 
-  function FreshWaterSystemCard() {
-    const fw = utilitiesPanel.fwSystem;
-    if (!fw) return null;
-
-    const selId = fw.fieldIds.SELECTED_PUMP;
-    const prId = fw.fieldIds.FW_PRESSURE;
-
-    const selKey = selId ? `${fw.equipmentId}:${selId}` : null;
-    const prKey = prId ? `${fw.equipmentId}:${prId}` : null;
-
-    const selVal = selKey ? utilValues[selKey] ?? "NONE" : "NONE";
-    const pump1 = selVal === "1" || selVal === "BOTH";
-    const pump2 = selVal === "2" || selVal === "BOTH";
-
-    const setPumps = (p1: boolean, p2: boolean) => {
-      let next = "NONE";
-      if (p1 && p2) next = "BOTH";
-      else if (p1) next = "1";
-      else if (p2) next = "2";
-      if (selKey) setUtilValues((m) => ({ ...m, [selKey]: next }));
-    };
-
-    const pressureVal = prKey ? utilValues[prKey] ?? "" : "";
-
-    return (
-      <div className="rounded border p-3 space-y-3">
-        <div className="text-sm font-semibold">{fw.equipmentName}</div>
-        <p className="text-xs text-gray-500">Location: {fw.locationName ?? "Unknown"}</p>
-
-        <div className="rounded border p-3 space-y-2">
-          <div className="text-sm font-semibold">Pumps running</div>
-          <div className="flex gap-6 items-center">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                disabled={saving || headerLocked || !selKey}
-                checked={pump1}
-                onChange={(e) => setPumps(e.target.checked, pump2)}
-              />
-              Pump 1
-            </label>
-
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                disabled={saving || headerLocked || !selKey}
-                checked={pump2}
-                onChange={(e) => setPumps(pump1, e.target.checked)}
-              />
-              Pump 2
-            </label>
-          </div>
-          {!selKey ? <p className="text-xs text-gray-500">SELECTED_PUMP not configured.</p> : null}
-        </div>
-
-        <label className="text-sm block">
-          System Pressure (bar)
-          <input
-            className="mt-1 w-full rounded border p-2"
-            value={pressureVal}
-            disabled={saving || headerLocked || !prKey}
-            onChange={(e) => prKey && setUtilValues((m) => ({ ...m, [prKey]: e.target.value }))}
-            inputMode="decimal"
-            placeholder="e.g., 3.2"
-          />
-        </label>
-        {!prKey ? <p className="text-xs text-gray-500">FW_PRESSURE not configured.</p> : null}
-
-        <div className="rounded border p-3 text-sm">
-          <div className="flex items-center justify-between">
-            <span className="font-semibold">Fresh Water Level</span>
-            <span className="text-gray-600">— %</span>
-          </div>
-          <p className="text-xs text-gray-500 mt-1">Will link from Tanks tab once built.</p>
-        </div>
-
-        <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
-      </div>
-    );
-  }
-
-  function CircPumpCard() {
-    const c = utilitiesPanel.circPump;
-    if (!c) return null;
-
-    const runId = c.fieldIds.RUNNING;
-    const runKey = runId ? `${c.equipmentId}:${runId}` : null;
-    const checked = runKey ? (utilValues[runKey] ?? "false") === "true" : false;
-
-    return (
-      <div className="rounded border p-3 space-y-3">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">{c.equipmentName}</div>
-            <p className="text-xs text-gray-500">Location: {c.locationName ?? "Unknown"}</p>
-          </div>
-
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              disabled={saving || headerLocked || !runKey}
-              checked={checked}
-              onChange={(e) => runKey && setUtilValues((m) => ({ ...m, [runKey]: e.target.checked ? "true" : "false" }))}
-              aria-label="On/Off"
-              title="On/Off"
-            />
-          </label>
-        </div>
-
-        {!runKey ? <p className="text-xs text-gray-500">RUNNING not configured.</p> : null}
-        <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
-      </div>
-    );
-  }
-
-  function BoilersBlock() {
-    const boilers = utilitiesPanel.boilers ?? [];
-    if (!boilers.length) return null;
-
-    return (
-      <div className="rounded border p-3 space-y-3">
-        <div className="text-sm font-semibold">Boilers</div>
-
-        <div className="space-y-3">
-          {boilers.map((b) => {
-            const runId = b.fieldIds.RUNNING;
-            const tmpId = b.fieldIds.BOILER_TEMP;
-
-            const runKey = runId ? `${b.equipmentId}:${runId}` : null;
-            const tmpKey = tmpId ? `${b.equipmentId}:${tmpId}` : null;
-
-            const running = runKey ? (utilValues[runKey] ?? "false") === "true" : false;
-            const tempVal = tmpKey ? utilValues[tmpKey] ?? "" : "";
-
-            return (
-              <div key={b.equipmentId} className="rounded border p-3 space-y-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold">{b.equipmentName}</div>
-                    <p className="text-xs text-gray-500">Location: {b.locationName ?? "Unknown"}</p>
-                  </div>
-
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      disabled={saving || headerLocked || !runKey}
-                      checked={running}
-                      onChange={(e) => runKey && setUtilValues((m) => ({ ...m, [runKey]: e.target.checked ? "true" : "false" }))}
-                      aria-label="On/Off"
-                      title="On/Off"
-                    />
-                  </label>
-                </div>
-
-                <label className="text-sm block">
-                  Boiler Temp (°C)
-                  <input
-                    className="mt-1 w-full rounded border p-2 disabled:bg-gray-50"
-                    value={tempVal}
-                    disabled={saving || headerLocked || !tmpKey || !running}
-                    onChange={(e) => tmpKey && setUtilValues((m) => ({ ...m, [tmpKey]: e.target.value }))}
-                    inputMode="decimal"
-                    placeholder="e.g., 60"
-                  />
-                </label>
-
-                {!tmpKey ? <p className="text-xs text-gray-500">BOILER_TEMP not configured.</p> : null}
-                <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    );
-  }
-
   function ChillerPlantCard() {
     const chillers = (chillerPlant.chillers ?? []).filter(isChiller);
     const chw = isChwSelect(chillerPlant.chwPumps) ? chillerPlant.chwPumps : null;
     const sw = isSwSelect(chillerPlant.swPumps) ? chillerPlant.swPumps : null;
 
-    const renderSelector = (sel: Extract<ChillerPlantTarget, { kind: "CHW_SELECT" | "SW_SELECT" }>) => {
+    const renderSelector = (sel: Extract<ChillerPlantTarget, { kind: "CHW_SELECT" | "SW_SELECT" }>, title: string) => {
       const fieldId = sel.fieldIds.SELECTED_PUMP;
-      if (!fieldId) {
-        return <div className="rounded border p-3 text-sm text-gray-600">{sel.equipmentName}: SELECTED_PUMP not configured</div>;
-      }
+      if (!fieldId) return <div className="rounded border p-3 text-sm text-gray-600">{title}: not configured</div>;
       const key = `${sel.equipmentId}:${fieldId}`;
       const value = cpValues[key] ?? "1";
 
       return (
         <div className="rounded border p-3 space-y-2">
-          <div className="text-sm font-semibold">{sel.equipmentName}</div>
+          <div className="text-sm font-semibold">{title}</div>
           <select
             className="w-full rounded border p-2"
             disabled={saving || headerLocked}
@@ -873,8 +777,8 @@ export default function DailyLogClient({
         <h4 className="text-sm font-semibold">Chiller Plant (Center-Top)</h4>
 
         <div className="grid gap-3 md:grid-cols-2">
-          {chw ? renderSelector(chw) : <div className="rounded border p-3 text-sm text-gray-600">CHW selector not found.</div>}
-          {sw ? renderSelector(sw) : <div className="rounded border p-3 text-sm text-gray-600">SW selector not found.</div>}
+          {chw ? renderSelector(chw, "CHW Pumps (Select 1/2)") : <div className="rounded border p-3 text-sm text-gray-600">CHW selector not found.</div>}
+          {sw ? renderSelector(sw, "SW Pumps (Select 1/2)") : <div className="rounded border p-3 text-sm text-gray-600">SW selector not found.</div>}
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -942,68 +846,219 @@ export default function DailyLogClient({
     );
   }
 
-  async function createDefect() {
-    setDefectErr(null);
-    setDefectOk(null);
+  function FreshWaterSystemCard() {
+    const fw = utilitiesPanel.fwSystem;
+    if (!fw) return null;
 
-    const t = defectTitle.trim();
-    if (!t) {
-      setDefectErr("Please enter a defect title.");
-      return;
-    }
+    const selId = fw.fieldIds.SELECTED_PUMP;
+    const prId = fw.fieldIds.FW_PRESSURE;
 
-    setSaving(true);
-    try {
-      const res = await fetch("/api/defects", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({
-          dailyLogId,
-          title: t,
-          location_text: locationText || null,
-        }),
-      });
+    const selKey = selId ? `${fw.equipmentId}:${selId}` : null;
+    const prKey = prId ? `${fw.equipmentId}:${prId}` : null;
 
-      const json: unknown = await safeReadJson(res);
-      if (!res.ok) throw new Error(getErrorMessage(json, "Failed to create defect"));
+    const selVal = selKey ? utilValues[selKey] ?? "NONE" : "NONE";
+    const pump1 = selVal === "1" || selVal === "BOTH";
+    const pump2 = selVal === "2" || selVal === "BOTH";
 
-      const defectNo = getDefectNo(json);
-      setDefectOk(defectNo || "Created");
-      setDefectTitle("");
-    } catch (e: unknown) {
-      setDefectErr(e instanceof Error ? e.message : "Failed to create defect");
-    } finally {
-      setSaving(false);
-    }
+    const setPumps = (p1: boolean, p2: boolean) => {
+      let next = "NONE";
+      if (p1 && p2) next = "BOTH";
+      else if (p1) next = "1";
+      else if (p2) next = "2";
+      if (selKey) setUtilValues((m) => ({ ...m, [selKey]: next }));
+    };
+
+    const pressureVal = prKey ? utilValues[prKey] ?? "" : "";
+
+    return (
+      <div className="rounded border p-3 space-y-3">
+        <div className="text-sm font-semibold">{fw.equipmentName}</div>
+        <p className="text-xs text-gray-500">Location: {fw.locationName ?? "Unknown"}</p>
+
+        <div className="rounded border p-3 space-y-2">
+          <div className="text-sm font-semibold">Pumps running</div>
+          <div className="flex gap-6 items-center">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={saving || headerLocked || !selKey}
+                checked={pump1}
+                onChange={(e) => setPumps(e.target.checked, pump2)}
+              />
+              Pump 1
+            </label>
+
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={saving || headerLocked || !selKey}
+                checked={pump2}
+                onChange={(e) => setPumps(pump1, e.target.checked)}
+              />
+              Pump 2
+            </label>
+          </div>
+        </div>
+
+        <label className="text-sm block">
+          System Pressure (bar)
+          <input
+            className="mt-1 w-full rounded border p-2"
+            value={pressureVal}
+            disabled={saving || headerLocked || !prKey}
+            onChange={(e) => prKey && setUtilValues((m) => ({ ...m, [prKey]: e.target.value }))}
+            inputMode="decimal"
+            placeholder="e.g., 3.2"
+          />
+        </label>
+
+        <div className="rounded border p-3 text-sm">
+          <div className="flex items-center justify-between">
+            <span className="font-semibold">Fresh Water Level</span>
+            <span className="text-gray-600">— %</span>
+          </div>
+          <p className="text-xs text-gray-500 mt-1">Will link from Tanks tab once built.</p>
+        </div>
+
+        <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
+      </div>
+    );
   }
 
-  async function submitDailyLog() {
-    setSubmitErr(null);
-    setSubmitOk(null);
+  function CircPumpCard() {
+    const c = utilitiesPanel.circPump;
+    if (!c) return null;
 
-    if (headerLocked) {
-      setSubmitErr("Already submitted.");
-      return;
-    }
+    const runId = c.fieldIds.RUNNING;
+    const runKey = runId ? `${c.equipmentId}:${runId}` : null;
+    const checked = runKey ? (utilValues[runKey] ?? "false") === "true" : false;
 
-    if (submitBlocked.length) {
-      setSubmitErr(`Cannot submit. Missing OK: ${submitBlocked.join(", ")}`);
-      return;
-    }
+    return (
+      <div className="rounded border p-3 space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">{c.equipmentName}</div>
+            <p className="text-xs text-gray-500">Location: {c.locationName ?? "Unknown"}</p>
+          </div>
 
-    setSaving(true);
-    try {
-      const res = await fetch(`/api/daily-logs/${dailyLogId}/submit`, { method: "POST", cache: "no-store" });
-      const json: unknown = await safeReadJson(res);
-      if (!res.ok) throw new Error(getErrorMessage(json, "Failed to submit daily log"));
-      setSubmitOk("Submitted");
-    } catch (e: unknown) {
-      setSubmitErr(e instanceof Error ? e.message : "Failed to submit daily log");
-    } finally {
-      setSaving(false);
-    }
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              disabled={saving || headerLocked || !runKey}
+              checked={checked}
+              onChange={(e) => runKey && setUtilValues((m) => ({ ...m, [runKey]: e.target.checked ? "true" : "false" }))}
+              aria-label="On/Off"
+              title="On/Off"
+            />
+          </label>
+        </div>
+
+        <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
+      </div>
+    );
   }
+
+  function BoilersBlock() {
+    const boilers = utilitiesPanel.boilers ?? [];
+    if (!boilers.length) return null;
+
+    return (
+      <div className="rounded border p-3 space-y-3">
+        <div className="text-sm font-semibold">Boilers</div>
+
+        <div className="space-y-3">
+          {boilers.map((b) => {
+            const runId = b.fieldIds.RUNNING;
+            const tmpId = b.fieldIds.BOILER_TEMP;
+
+            const runKey = runId ? `${b.equipmentId}:${runId}` : null;
+            const tmpKey = tmpId ? `${b.equipmentId}:${tmpId}` : null;
+
+            const running = runKey ? (utilValues[runKey] ?? "false") === "true" : false;
+            const tempVal = tmpKey ? utilValues[tmpKey] ?? "" : "";
+
+            return (
+              <div key={b.equipmentId} className="rounded border p-3 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold">{b.equipmentName}</div>
+                    <p className="text-xs text-gray-500">Location: {b.locationName ?? "Unknown"}</p>
+                  </div>
+
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      disabled={saving || headerLocked || !runKey}
+                      checked={running}
+                      onChange={(e) => runKey && setUtilValues((m) => ({ ...m, [runKey]: e.target.checked ? "true" : "false" }))}
+                      aria-label="On/Off"
+                      title="On/Off"
+                    />
+                  </label>
+                </div>
+
+                <label className="text-sm block">
+                  Boiler Temp (°C)
+                  <input
+                    className="mt-1 w-full rounded border p-2 disabled:bg-gray-50"
+                    value={tempVal}
+                    disabled={saving || headerLocked || !tmpKey || !running}
+                    onChange={(e) => tmpKey && setUtilValues((m) => ({ ...m, [tmpKey]: e.target.value }))}
+                    inputMode="decimal"
+                    placeholder="e.g., 60"
+                  />
+                </label>
+
+                <p className="text-xs text-gray-500">Saved via “Save Engine Room”.</p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // ----- Derived lists + inline notifications -----
+  const mePort = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "PORT");
+  const meCenter = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "CENTER");
+  const meStbd = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "STBD");
+
+  const dgPort = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "PORT");
+  const dgCenter = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "CENTER");
+  const dgStbd = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "STBD");
+
+  const portWatermakers = (watermakerPanel.items ?? []).filter((i) => sideFromLocationName(i.locationName) === "PORT");
+
+  const portBatteryBanks = (batteryPanel.items ?? []).filter((i) => sideFromLocationName(i.locationName) === "PORT");
+  const centerBatteryBanks = (batteryPanel.items ?? []).filter((i) => sideFromLocationName(i.locationName) === "CENTER");
+  const stbdBatteryBanks = (batteryPanel.items ?? []).filter((i) => sideFromLocationName(i.locationName) === "STBD");
+
+  const notifications = useMemo(() => {
+    const items: Array<{ id: string; title: string; message: string; source: string }> = [];
+
+    for (const wm of watermakerPanel.items ?? []) {
+      const fid = wm.fieldIds.WM_DAYS_SINCE_FLUSH;
+      if (!fid) continue;
+
+      const key = `${wm.equipmentId}:${fid}`;
+      const raw = String(watermakerValues[key] ?? "").trim();
+      const n = raw ? Number(raw) : NaN;
+
+      if (Number.isFinite(n) && n > 7) {
+        const id = `wm_flush_overdue:${wm.equipmentId}`;
+        items.push({
+          id,
+          title: "Watermaker flush overdue",
+          message: `${wm.equipmentName}: ${n} days since flush (limit 7)`,
+          source: "S06 Daily Log",
+        });
+      }
+    }
+
+    return items.filter((x) => !notifDismissed[x.id]);
+  }, [watermakerPanel.items, watermakerValues, notifDismissed]);
+
+  const canSubmit = !saving && !headerLocked && submitBlocked.length === 0;
 
   function TabButton({ code, label }: { code: TabCode; label: string }) {
     const ind = tabIndicator(code);
@@ -1032,7 +1087,8 @@ export default function DailyLogClient({
           <div>
             <h2 className="text-lg font-semibold">{title}</h2>
             <p className="text-sm text-gray-600">
-              Status: <b>{status}</b> • Requirement: {ind.kind === "na" ? "Not required today" : tabState[code]?.ok ? "OK complete" : "Needs OK"}
+              Status: <b>{status}</b> • Requirement:{" "}
+              {ind.kind === "na" ? "Not required today" : tabState[code]?.ok ? "OK complete" : "Needs OK"}
             </p>
           </div>
 
@@ -1053,15 +1109,63 @@ export default function DailyLogClient({
     );
   }
 
-  const mePort = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "PORT");
-  const meCenter = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "CENTER");
-  const meStbd = mainEngines.filter((t) => sideFromLocationName(t.locationName) === "STBD");
+  async function createDefect() {
+    setDefectErr(null);
+    setDefectOk(null);
 
-  const dgPort = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "PORT");
-  const dgCenter = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "CENTER");
-  const dgStbd = dieselGens.filter((t) => sideFromLocationName(t.locationName) === "STBD");
+    const t = defectTitle.trim();
+    if (!t) {
+      setDefectErr("Please enter a defect title.");
+      return;
+    }
 
-  const canSubmit = !saving && !headerLocked && submitBlocked.length === 0;
+    setSaving(true);
+    try {
+      const res = await fetch("/api/defects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ dailyLogId, title: t, location_text: locationText || null }),
+      });
+
+      const json: unknown = await safeReadJson(res);
+      if (!res.ok) throw new Error(getErrorMessage(json, "Failed to create defect"));
+
+      const defectNo = getDefectNo(json);
+      setDefectOk(defectNo || "Created");
+      setDefectTitle("");
+    } catch (e: unknown) {
+      setDefectErr(e instanceof Error ? e.message : "Failed to create defect");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function submitDailyLog() {
+    setSubmitErr(null);
+    setSubmitOk(null);
+
+    if (headerLocked) {
+      setSubmitErr("Already submitted.");
+      return;
+    }
+    if (submitBlocked.length) {
+      setSubmitErr(`Cannot submit. Missing OK: ${submitBlocked.join(", ")}`);
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/daily-logs/${dailyLogId}/submit`, { method: "POST", cache: "no-store" });
+      const json: unknown = await safeReadJson(res);
+      if (!res.ok) throw new Error(getErrorMessage(json, "Failed to submit daily log"));
+      setSubmitOk("Submitted");
+    } catch (e: unknown) {
+      setSubmitErr(e instanceof Error ? e.message : "Failed to submit daily log");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -1086,6 +1190,66 @@ export default function DailyLogClient({
           </button>
         </div>
       </div>
+
+      {/* Inline notifications banner (MVP) */}
+      {activeTab === "MAIN" && notifications.length ? (
+        <div className="rounded border border-amber-200 bg-amber-50 p-3">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="text-sm">
+              <b>{notifications.length}</b> warning{notifications.length === 1 ? "" : "s"} detected
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded border px-3 py-1 text-sm bg-white"
+                onClick={() => setNotifOpen((v) => !v)}
+              >
+                {notifOpen ? "Hide" : "View"}
+              </button>
+
+              <button
+                type="button"
+                className="rounded border px-3 py-1 text-sm bg-white"
+                onClick={() => {
+                  setNotifDismissed((m) => {
+                    const next = { ...m };
+                    for (const n of notifications) next[n.id] = true;
+                    return next;
+                  });
+                  setNotifOpen(false);
+                }}
+              >
+                Dismiss all
+              </button>
+            </div>
+          </div>
+
+          {notifOpen ? (
+            <div className="mt-3 space-y-2">
+              {notifications.map((n) => (
+                <div key={n.id} className="rounded border bg-white p-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="text-sm">
+                      <div className="font-semibold">{n.title}</div>
+                      <div className="text-gray-700">{n.message}</div>
+                      <div className="text-xs text-gray-500">{n.source}</div>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="rounded border px-2 py-1 text-xs bg-white"
+                      onClick={() => setNotifDismissed((m) => ({ ...m, [n.id]: true }))}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Gating banner */}
       {activeTab === "MAIN" ? (
@@ -1190,39 +1354,324 @@ export default function DailyLogClient({
           {engineErr ? <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{engineErr}</p> : null}
 
           <div className="grid gap-4 md:grid-cols-3">
+            {/* PORT */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Port</h3>
-              <div className="rounded border p-3 space-y-2">
-                <h4 className="text-sm font-semibold">Main Engines</h4>
-                <RunHoursList items={mePort} />
+
+              <div className="rounded border p-3 space-y-3 min-h-[260px]">
+                <h4 className="text-sm font-semibold">Run Hours</h4>
+
+                <div className="space-y-2">
+                  <h5 className="text-xs font-semibold text-gray-600">Main Engines</h5>
+                  <RunHoursList items={mePort} />
+                </div>
+
+                <div className="space-y-2">
+                  <h5 className="text-xs font-semibold text-gray-600">Generators</h5>
+                  <RunHoursList items={dgPort} />
+                </div>
               </div>
-              <div className="rounded border p-3 space-y-2">
-                <h4 className="text-sm font-semibold">Generators</h4>
-                <RunHoursList items={dgPort} />
+
+              <div className="rounded border p-3 space-y-3">
+                <h4 className="text-sm font-semibold">Battery Banks</h4>
+                {portBatteryBanks.length ? (
+                  portBatteryBanks
+                    .slice()
+                    .sort((a, b) => orderBatteryBanks(a.equipmentName, b.equipmentName))
+                    .map((item) => (
+                      <div key={item.equipmentId} className="rounded border p-3 space-y-2">
+                        <h5 className="text-sm font-medium">{item.equipmentName}</h5>
+                        <div className="grid gap-2 grid-cols-2">
+                          {item.fieldIds.BANK_VOLTAGE ? (
+                            <label className="text-sm block">
+                              Voltage
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                          {item.fieldIds.BANK_SOC ? (
+                            <label className="text-sm block">
+                              SOC (%)
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_SOC}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_SOC}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))
+                ) : (
+                  <p className="text-sm text-gray-500">None</p>
+                )}
+              </div>
+
+              <div className="rounded border p-3 space-y-3">
+                <h4 className="text-sm font-semibold">Watermakers</h4>
+
+                {portWatermakers.length ? (
+                  portWatermakers.map((item) => {
+                    const statusId = item.fieldIds.PUMP_STATUS;
+                    const statusKey = statusId ? `${item.equipmentId}:${statusId}` : null;
+
+                    const flushId = item.fieldIds.WM_DAYS_SINCE_FLUSH;
+                    const flushKey = flushId ? `${item.equipmentId}:${flushId}` : null;
+
+                    return (
+                      <div key={item.equipmentId} className="rounded border p-3 space-y-3">
+                        <h5 className="text-sm font-medium">{item.equipmentName}</h5>
+
+                        <div className="space-y-2">
+                          <div className="text-sm">Status</div>
+                          <div className="flex flex-wrap gap-2 items-center">
+                            {statusKey ? (
+                              <>
+                                {["RUNNING", "STANDBY"].map((v) => {
+                                  const active = (watermakerValues[statusKey] ?? "") === v;
+                                  return (
+                                    <button
+                                      key={v}
+                                      type="button"
+                                      disabled={saving || headerLocked}
+                                      onClick={() => setWatermakerValue(statusKey, v)}
+                                      className={
+                                        "px-3 py-1 rounded-full border text-sm " +
+                                        (active ? "bg-black text-white" : "bg-white")
+                                      }
+                                    >
+                                      {v === "RUNNING" ? "Running" : "Standby"}
+                                    </button>
+                                  );
+                                })}
+                              </>
+                            ) : (
+                              <span className="text-xs text-gray-500">PUMP_STATUS not configured</span>
+                            )}
+
+                            {flushKey ? (
+                              <button
+                                type="button"
+                                disabled={saving || headerLocked}
+                                onClick={() => setWatermakerValue(flushKey, "0")}
+                                className="px-3 py-1 rounded-full border text-sm bg-white whitespace-nowrap"
+                                title="Set flushed to 0"
+                              >
+                                Flushed
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        <div className="grid gap-2 md:grid-cols-4">
+                          {item.fieldIds.RUN_HOURS ? (
+                            <label className="text-sm block">
+                              <span className="block h-5 leading-5">Run Hours</span>
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={watermakerValues[`${item.equipmentId}:${item.fieldIds.RUN_HOURS}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setWatermakerValue(`${item.equipmentId}:${item.fieldIds.RUN_HOURS}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+
+                          {item.fieldIds.WATER_PPM ? (
+                            <label className="text-sm block">
+                              <span className="block h-5 leading-5">PPM</span>
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={watermakerValues[`${item.equipmentId}:${item.fieldIds.WATER_PPM}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setWatermakerValue(`${item.equipmentId}:${item.fieldIds.WATER_PPM}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+
+                          {item.fieldIds.WATER_LPH ? (
+                            <label className="text-sm block">
+                              <span className="block h-5 leading-5">Output (L/h)</span>
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={watermakerValues[`${item.equipmentId}:${item.fieldIds.WATER_LPH}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setWatermakerValue(`${item.equipmentId}:${item.fieldIds.WATER_LPH}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+
+                          {flushKey ? (
+                            <label className="text-sm block">
+                              <span className="block h-5 leading-5">Flushed</span>
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="numeric"
+                                value={watermakerValues[flushKey] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) => setWatermakerValue(flushKey, e.target.value)}
+                              />
+                            </label>
+                          ) : (
+                            <div className="text-xs text-gray-500 flex items-end">Flushed not configured</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <p className="text-sm text-gray-500">None</p>
+                )}
               </div>
             </div>
 
+            {/* CENTER */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Center</h3>
-              <PowerCard />
-              <ChillerPlantCard />
+
+              <div className="min-h-[260px]">
+                <PowerCard />
+              </div>
+
+              <div className="rounded border p-3 space-y-3">
+                <h4 className="text-sm font-semibold">Battery Banks</h4>
+                {centerBatteryBanks.length ? (
+                  centerBatteryBanks
+                    .slice()
+                    .sort((a, b) => a.equipmentName.localeCompare(b.equipmentName))
+                    .map((item) => (
+                      <div key={item.equipmentId} className="rounded border p-3 space-y-2">
+                        <h5 className="text-sm font-medium">{item.equipmentName}</h5>
+                        <div className="grid gap-2 grid-cols-2">
+                          {item.fieldIds.BANK_VOLTAGE ? (
+                            <label className="text-sm block">
+                              Voltage
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                          {item.fieldIds.BANK_SOC ? (
+                            <label className="text-sm block">
+                              SOC (%)
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_SOC}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_SOC}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))
+                ) : (
+                  <p className="text-sm text-gray-500">None</p>
+                )}
+              </div>
+
               <div className="rounded border p-3 space-y-2">
                 <h4 className="text-sm font-semibold">Center equipment (run-hours)</h4>
-                {[...meCenter, ...dgCenter].length ? <RunHoursList items={[...meCenter, ...dgCenter]} /> : <p className="text-sm text-gray-500">None</p>}
+                {[...meCenter, ...dgCenter].length ? (
+                  <RunHoursList items={[...meCenter, ...dgCenter]} />
+                ) : (
+                  <p className="text-sm text-gray-500">None</p>
+                )}
               </div>
+
+              <ChillerPlantCard />
             </div>
 
+            {/* STARBOARD */}
             <div className="space-y-4">
               <h3 className="text-base font-semibold">Starboard</h3>
 
-              <div className="rounded border p-3 space-y-2">
-                <h4 className="text-sm font-semibold">Main Engines</h4>
-                <RunHoursList items={meStbd} />
+              <div className="rounded border p-3 space-y-3 min-h-[260px]">
+                <h4 className="text-sm font-semibold">Run Hours</h4>
+
+                <div className="space-y-2">
+                  <h5 className="text-xs font-semibold text-gray-600">Main Engines</h5>
+                  <RunHoursList items={meStbd} />
+                </div>
+
+                <div className="space-y-2">
+                  <h5 className="text-xs font-semibold text-gray-600">Generators</h5>
+                  <RunHoursList items={dgStbd} />
+                </div>
               </div>
 
-              <div className="rounded border p-3 space-y-2">
-                <h4 className="text-sm font-semibold">Generators</h4>
-                <RunHoursList items={dgStbd} />
+              <div className="rounded border p-3 space-y-3">
+                <h4 className="text-sm font-semibold">Battery Banks</h4>
+                {stbdBatteryBanks.length ? (
+                  stbdBatteryBanks
+                    .slice()
+                    .sort((a, b) => orderBatteryBanks(a.equipmentName, b.equipmentName))
+                    .map((item) => (
+                      <div key={item.equipmentId} className="rounded border p-3 space-y-2">
+                        <h5 className="text-sm font-medium">{item.equipmentName}</h5>
+                        <div className="grid gap-2 grid-cols-2">
+                          {item.fieldIds.BANK_VOLTAGE ? (
+                            <label className="text-sm block">
+                              Voltage
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_VOLTAGE}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                          {item.fieldIds.BANK_SOC ? (
+                            <label className="text-sm block">
+                              SOC (%)
+                              <input
+                                className="mt-1 w-full rounded border p-2"
+                                inputMode="decimal"
+                                value={batteryValues[`${item.equipmentId}:${item.fieldIds.BANK_SOC}`] ?? ""}
+                                disabled={saving || headerLocked}
+                                onChange={(e) =>
+                                  setBatteryValue(`${item.equipmentId}:${item.fieldIds.BANK_SOC}`, e.target.value)
+                                }
+                              />
+                            </label>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))
+                ) : (
+                  <p className="text-sm text-gray-500">None</p>
+                )}
               </div>
 
               <div className="rounded border p-3 space-y-3">
@@ -1294,7 +1743,7 @@ export default function DailyLogClient({
         {defectErr ? <p className="text-sm rounded bg-red-50 border border-red-200 p-2">{defectErr}</p> : null}
       </section>
 
-      {/* Notes moved here (after defects) */}
+      {/* Notes */}
       <section className="rounded border p-4 space-y-3">
         <h2 className="text-lg font-semibold">Daily Log Notes</h2>
 
